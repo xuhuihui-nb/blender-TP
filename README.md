@@ -1,9 +1,13 @@
 # blender-TP
 手动拓扑/Manual topology
-目前的基础功能
+
+目前的基础功能:
+
 1鼠标绘制拓扑线
+
 2创建环绕线
-3自动填充栅格
+
+3自动填充栅格(此功能只有简单的填充,复杂的算法还在开发中）
 
 <img width="344" height="176" alt="image" src="https://github.com/user-attachments/assets/f1dbfdae-2c62-4895-997a-2b789550bb21" />
 
