@@ -14,3 +14,16 @@
 安装方法：将解压后的文件夹内的名为TP的文件夹移动到你的blender插件存放的文件夹内.默认的blender zip文件 安装方式是无效的
 <img width="1128" height="408" alt="image" src="https://github.com/user-attachments/assets/4c15ba6d-9ed2-44d0-92ea-63e37b79e71b" />
 
+Current basic functions:
+1. Use the mouse to draw topological lines
+2. Create a surround line
+3 Automatic Grid Filling (This feature only has simple filling, complex algorithms are still under development)
+Current basic functions:
+
+1. Use the mouse to draw topological lines
+
+2. Create a surround line
+
+3 Automatic Grid Filling (This feature only has simple filling, complex algorithms are still under development)
+
+
