@@ -16,5 +16,7 @@
 
 注：本插件拓扑出来的内容支持在retopoflow中使用调整工具进行优化。
 
+<img width="1728" height="926" alt="image" src="https://github.com/user-attachments/assets/51d18810-ebb7-4ca1-ae99-8f99bf3f5e38" />
+
 
 
