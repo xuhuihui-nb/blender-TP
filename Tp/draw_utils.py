@@ -95,6 +95,73 @@ def draw_callback(self, context):
                 except Exception:
                     pass
 
+    # 3. Draw pinned boundary vertices/edges overlay
+    if context.scene.tp_pin_boundary:
+        topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+        if topo_obj and topo_obj.type == 'MESH':
+            pinned_coords = []
+            pinned_edges = []
+            matrix_world = topo_obj.matrix_world
+            is_edit = (topo_obj.mode == 'EDIT')
+            
+            if is_edit:
+                try:
+                    bm = bmesh.from_edit_mesh(topo_obj.data)
+                    pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+                    if pin_layer:
+                        for v in bm.verts:
+                            if v[pin_layer] == 1:
+                                pinned_coords.append(matrix_world @ v.co)
+                        for e in bm.edges:
+                            if e.verts[0][pin_layer] == 1 and e.verts[1][pin_layer] == 1:
+                                pinned_edges.append((matrix_world @ e.verts[0].co, matrix_world @ e.verts[1].co))
+                except Exception:
+                    pass
+            else:
+                mesh = topo_obj.data
+                pin_attr = mesh.attributes.get("tp_is_pinned")
+                if pin_attr:
+                    for i, v in enumerate(mesh.vertices):
+                        if pin_attr.data[i].value == 1:
+                            pinned_coords.append(matrix_world @ v.co)
+                    for e in mesh.edges:
+                        if pin_attr.data[e.vertices[0]].value == 1 and pin_attr.data[e.vertices[1]].value == 1:
+                            pinned_edges.append((matrix_world @ mesh.vertices[e.vertices[0]].co, matrix_world @ mesh.vertices[e.vertices[1]].co))
+            
+            shader = get_shader()
+            if shader and (pinned_coords or pinned_edges):
+                shader.bind()
+                # Pure White color: (1.0, 1.0, 1.0, 1.0)
+                shader.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
+                
+                # 1. Always draw edges (lines) if they exist
+                if pinned_edges:
+                    try:
+                        gpu.state.line_width_set(4.0)
+                    except Exception:
+                        pass
+                    coords = []
+                    for p1, p2 in pinned_edges:
+                        coords.append(tuple(p1))
+                        coords.append(tuple(p2))
+                    try:
+                        batch_pinned_edges = batch_for_shader(shader, 'LINES', {"pos": coords})
+                        batch_pinned_edges.draw(shader)
+                    except Exception:
+                        pass
+                
+                # 2. Always draw points (dots) if they exist
+                if pinned_coords:
+                    try:
+                        gpu.state.point_size_set(10.0)
+                    except Exception:
+                        pass
+                    try:
+                        batch_pinned = batch_for_shader(shader, 'POINTS', {"pos": [tuple(p) for p in pinned_coords]})
+                        batch_pinned.draw(shader)
+                    except Exception:
+                        pass
+
 def draw_text_callback(self, context):
     # 1. Draw hover snap point indicator
     if self.hover_snap_pt:

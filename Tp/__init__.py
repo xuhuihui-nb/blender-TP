@@ -1,8 +1,8 @@
 bl_info = {
     "name": "TP拓扑",
-    "author": "huihui-nb",
-    "version": (1, 0, 4),
-    "blender": (5, 0, 1),
+    "author": "Antigravity",
+    "version": (2, 1, 0),
+    "blender": (3, 0, 0),
     "location": "View3D > Sidebar > TP拓扑",
     "description": "在被选网格对象表面绘制连续拓扑线的工具",
     "warning": "",
@@ -31,6 +31,8 @@ from . import ui
 classes = (
     op_draw.OBJECT_OT_tp_topology_draw,
     op_grid_fill.OBJECT_OT_tp_topology_grid_fill,
+    op_grid_fill.OBJECT_OT_tp_topology_remove_grid,
+    ui.OBJECT_OT_tp_topology_auto_outline,
     ui.VIEW3D_PT_tp_topology,
 )
 
@@ -46,7 +48,7 @@ def register():
     bpy.types.Scene.tp_edge_length = bpy.props.FloatProperty(
         name="边长",
         description="控制绘制时的目标点间距",
-        default=0.15,
+        default=0.05,
         min=0.005,
         max=10.0,
         precision=3,
@@ -55,21 +57,26 @@ def register():
     bpy.types.Scene.tp_smooth_factor = bpy.props.FloatProperty(
         name="平滑力度",
         description="绘制结束后对线条进行自动平滑的强度 (0为不平滑)",
-        default=0.05,
+        default=0.0,
         min=0.0,
         max=1.0,
         precision=2,
         step=5.0
     )
-    bpy.types.Scene.tp_grid_decay = bpy.props.FloatProperty(
-        name="栅格渐变比例",
-        description="控制网格从外圈到内圈的尺寸收缩渐变程度 (0为无渐变)",
-        default=2.0,
-        min=0.0,
-        max=10.0,
-        precision=2,
-        step=10.0
+    bpy.types.Scene.tp_use_wrap = bpy.props.BoolProperty(
+        name="包裹",
+        description="拓扑时自动吸附并使用收缩包裹贴合表面",
+        default=True
     )
+    bpy.types.Scene.tp_pin_boundary = bpy.props.BoolProperty(
+        name="固定",
+        description="固定外圈的点（边界点）不可移动",
+        default=False,
+        update=op_draw.on_pin_boundary_update
+    )
+    
+    # Register depsgraph update handler
+    bpy.app.handlers.depsgraph_update_post.append(op_draw.tp_pin_depsgraph_handler)
 
 def unregister():
     for cls in classes:
@@ -78,7 +85,12 @@ def unregister():
     del bpy.types.WindowManager.tp_ref_object_name
     del bpy.types.Scene.tp_edge_length
     del bpy.types.Scene.tp_smooth_factor
-    del bpy.types.Scene.tp_grid_decay
+    del bpy.types.Scene.tp_use_wrap
+    del bpy.types.Scene.tp_pin_boundary
+    
+    # Unregister depsgraph update handler
+    if op_draw.tp_pin_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(op_draw.tp_pin_depsgraph_handler)
 
 if __name__ == "__main__":
     register()

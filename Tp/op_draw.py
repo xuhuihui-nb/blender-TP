@@ -67,7 +67,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
             self.rebuild_kd_tree()
             
-        self.ensure_shrinkwrap_modifier(context, topo_obj)
+        if context.scene.tp_use_wrap:
+            self.ensure_shrinkwrap_modifier(context, topo_obj)
         return topo_obj
 
     def ensure_shrinkwrap_modifier(self, context, topo_obj):
@@ -121,41 +122,66 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             if not topo_obj.select_get():
                 topo_obj.select_set(True)
             
-            self.ensure_shrinkwrap_modifier(context, topo_obj)
+            # 根据“包裹”状态动态控制修改器
+            if context.scene.tp_use_wrap:
+                self.ensure_shrinkwrap_modifier(context, topo_obj)
+            else:
+                mod = topo_obj.modifiers.get("TP_Shrinkwrap")
+                if mod:
+                    try:
+                        topo_obj.modifiers.remove(mod)
+                    except Exception:
+                        pass
                     
         # 强制自动合并
         if not context.scene.tool_settings.use_mesh_automerge:
             context.scene.tool_settings.use_mesh_automerge = True
             
-        # 强固面部吸附参数设置：在拖拽微调、滑动或G键移动时，直接由 C++ 执行 60FPS 实时投影包裹
-        if not context.scene.tool_settings.use_snap:
-            context.scene.tool_settings.use_snap = True
-            
-        try:
-            if context.scene.tool_settings.snap_elements != {'FACE_NEAREST'}:
-                context.scene.tool_settings.snap_elements = {'FACE_NEAREST'}
-        except Exception:
+        # 根据“包裹”状态动态控制吸附
+        if context.scene.tp_use_wrap:
+            if not context.scene.tool_settings.use_snap:
+                context.scene.tool_settings.use_snap = True
+                
             try:
-                if context.scene.tool_settings.snap_elements != {'FACE'}:
-                    context.scene.tool_settings.snap_elements = {'FACE'}
+                if context.scene.tool_settings.snap_elements != {'FACE_NEAREST'}:
+                    context.scene.tool_settings.snap_elements = {'FACE_NEAREST'}
+            except Exception:
+                try:
+                    if context.scene.tool_settings.snap_elements != {'FACE'}:
+                        context.scene.tool_settings.snap_elements = {'FACE'}
+                except Exception:
+                    pass
+                    
+            if context.scene.tool_settings.snap_target != 'CLOSEST':
+                context.scene.tool_settings.snap_target = 'CLOSEST'
+                
+            if hasattr(context.scene.tool_settings, "use_snap_project"):
+                if not context.scene.tool_settings.use_snap_project:
+                    context.scene.tool_settings.use_snap_project = True
+
+            if hasattr(context.scene.tool_settings, "use_snap_selectable"):
+                if context.scene.tool_settings.use_snap_selectable:
+                    context.scene.tool_settings.use_snap_selectable = False
+            if hasattr(context.scene.tool_settings, "use_snap_self"):
+                if context.scene.tool_settings.use_snap_self:
+                    context.scene.tool_settings.use_snap_self = False
+        else:
+            # 还原为备份的原始吸附状态
+            try:
+                if hasattr(self, 'orig_use_snap'):
+                    context.scene.tool_settings.use_snap = self.orig_use_snap
+                if hasattr(self, 'orig_snap_elements'):
+                    context.scene.tool_settings.snap_elements = self.orig_snap_elements
+                if hasattr(self, 'orig_snap_target'):
+                    context.scene.tool_settings.snap_target = self.orig_snap_target
+                if hasattr(self, 'orig_use_snap_project') and hasattr(context.scene.tool_settings, 'use_snap_project'):
+                    context.scene.tool_settings.use_snap_project = self.orig_use_snap_project
+                if hasattr(self, 'orig_use_snap_selectable') and hasattr(context.scene.tool_settings, "use_snap_selectable"):
+                    context.scene.tool_settings.use_snap_selectable = self.orig_use_snap_selectable
+                if hasattr(self, 'orig_use_snap_self') and hasattr(context.scene.tool_settings, "use_snap_self"):
+                    context.scene.tool_settings.use_snap_self = self.orig_use_snap_self
             except Exception:
                 pass
-                
-        if context.scene.tool_settings.snap_target != 'CLOSEST':
-            context.scene.tool_settings.snap_target = 'CLOSEST'
-            
-        # 核心选项：开启投影单一元素到高模面，使得 C++ 原生模态在调整时始终吸附
-        if hasattr(context.scene.tool_settings, "use_snap_project"):
-            if not context.scene.tool_settings.use_snap_project:
-                context.scene.tool_settings.use_snap_project = True
-
-        # 禁用仅吸附到可选择对象和吸附到自身，防止产生只能在边上吸附移动的bug
-        if hasattr(context.scene.tool_settings, "use_snap_selectable"):
-            if context.scene.tool_settings.use_snap_selectable:
-                context.scene.tool_settings.use_snap_selectable = False
-        if hasattr(context.scene.tool_settings, "use_snap_self"):
-            if context.scene.tool_settings.use_snap_self:
-                context.scene.tool_settings.use_snap_self = False
 
     def invoke(self, context, event):
         if context.window_manager.tp_topology_running:
@@ -261,17 +287,18 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
         context.scene.tool_settings.use_mesh_automerge = True
         
-        context.scene.tool_settings.use_snap = True
-        try:
-            context.scene.tool_settings.snap_elements = {'FACE_NEAREST'}
-        except Exception:
+        if context.scene.tp_use_wrap:
+            context.scene.tool_settings.use_snap = True
             try:
-                context.scene.tool_settings.snap_elements = {'FACE'}
+                context.scene.tool_settings.snap_elements = {'FACE_NEAREST'}
             except Exception:
-                pass
-        context.scene.tool_settings.snap_target = 'CLOSEST'
-        if hasattr(context.scene.tool_settings, "use_snap_project"):
-            context.scene.tool_settings.use_snap_project = True
+                try:
+                    context.scene.tool_settings.snap_elements = {'FACE'}
+                except Exception:
+                    pass
+            context.scene.tool_settings.snap_target = 'CLOSEST'
+            if hasattr(context.scene.tool_settings, "use_snap_project"):
+                context.scene.tool_settings.use_snap_project = True
         
         try:
             bpy.ops.ed.undo_push(message="进入拓扑模式")
@@ -410,7 +437,63 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             bmesh.update_edit_mesh(topo_obj.data)
                             self.report({'INFO'}, f"已选中圈 ({self.last_clicked_cycle_idx + 1}/{len(cycles)})")
                         else:
-                            self.report({'INFO'}, "该点不属于任何闭合圈")
+                            # 顶点环搜索失败，退回到边线选择作为退路
+                            nearest_edge = self.find_nearest_edge(context, mouse_coord, threshold_pixels=20)
+                            if nearest_edge:
+                                success_native = False
+                                if len(nearest_edge.link_faces) >= 1:
+                                    try:
+                                        if not event.shift:
+                                            for v in bm.verts:
+                                                v.select = False
+                                            for e in bm.edges:
+                                                e.select = False
+                                        
+                                        # 确保边被选中，并被设置为选择历史中的活动项
+                                        nearest_edge.select = True
+                                        bm.select_history.clear()
+                                        bm.select_history.add(nearest_edge)
+                                        bm.select_history.active = nearest_edge
+                                        bmesh.update_edit_mesh(topo_obj.data)
+                                        
+                                        selected_count_pre_op = sum(1 for e in bm.edges if e.select)
+                                        
+                                        # 确保拓扑对象为当前视图层的活动对象以调用此编辑模式操作符
+                                        context.view_layer.objects.active = topo_obj
+                                        bpy.ops.mesh.loop_select(extend=event.shift)
+                                        
+                                        # 重新加载网格数据并检查选择数量是否发生改变
+                                        bm = bmesh.from_edit_mesh(topo_obj.data)
+                                        bm.verts.ensure_lookup_table()
+                                        bm.edges.ensure_lookup_table()
+                                        
+                                        selected_count_post_op = sum(1 for e in bm.edges if e.select)
+                                        if selected_count_post_op > selected_count_pre_op:
+                                            success_native = True
+                                        else:
+                                            success_native = False
+                                    except Exception as e:
+                                        print("Native loop select failed, falling back:", e)
+                                        success_native = False
+                                        
+                                if not success_native:
+                                    chain_edges = self.find_edge_chain(nearest_edge)
+                                    
+                                    if not event.shift:
+                                        for v in bm.verts:
+                                            v.select = False
+                                        for e in bm.edges:
+                                            e.select = False
+                                            
+                                    for e in chain_edges:
+                                        e.select = True
+                                        e.verts[0].select = True
+                                        e.verts[1].select = True
+                                        
+                                    bmesh.update_edit_mesh(topo_obj.data)
+                                self.report({'INFO'}, "已通过邻近边选中循环线")
+                            else:
+                                self.report({'INFO'}, "该点不属于任何闭合圈")
                             
                     else:
                         nearest_edge = self.find_nearest_edge(context, mouse_coord, threshold_pixels=20)
@@ -423,16 +506,30 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                             v.select = False
                                         for e in bm.edges:
                                             e.select = False
+                                    
+                                    # 确保边被选中，并被设置为选择历史中的活动项
+                                    nearest_edge.select = True
                                     bm.select_history.clear()
                                     bm.select_history.add(nearest_edge)
+                                    bm.select_history.active = nearest_edge
                                     bmesh.update_edit_mesh(topo_obj.data)
                                     
+                                    selected_count_pre_op = sum(1 for e in bm.edges if e.select)
+                                    
+                                    # 确保拓扑对象为当前视图层的活动对象以调用此编辑模式操作符
+                                    context.view_layer.objects.active = topo_obj
                                     bpy.ops.mesh.loop_select(extend=event.shift)
                                     
+                                    # 重新加载网格数据并检查选择数量是否发生改变
                                     bm = bmesh.from_edit_mesh(topo_obj.data)
                                     bm.verts.ensure_lookup_table()
                                     bm.edges.ensure_lookup_table()
-                                    success_native = True
+                                    
+                                    selected_count_post_op = sum(1 for e in bm.edges if e.select)
+                                    if selected_count_post_op > selected_count_pre_op:
+                                        success_native = True
+                                    else:
+                                        success_native = False
                                 except Exception as e:
                                     print("Native loop select failed, falling back:", e)
                                     success_native = False
@@ -891,33 +988,58 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         return None, None
 
     def find_cycles_through_vertex(self, v_start, max_cycles=15, max_len=150):
-        from collections import deque
+        import collections
+        neighbors = []
+        # 获取所有符合边界条件 (link_faces <= 1) 的直连邻居
+        for e in v_start.link_edges:
+            if len(e.link_faces) <= 1:
+                neighbors.append(e.other_vert(v_start))
+                
         cycles = []
         seen_cycles = set()
         
-        queue = deque([(v_start, [v_start], {v_start.index})])
-        steps = 0
-        max_steps = 10000
-        
-        while queue and len(cycles) < max_cycles and steps < max_steps:
-            steps += 1
-            curr, path, visited = queue.popleft()
-            
-            valid_edges = [e for e in curr.link_edges if len(e.link_faces) <= 1]
-            for edge in valid_edges:
-                nbr = edge.other_vert(curr)
-                if nbr.index == v_start.index:
-                    if len(path) >= 3:
-                        canonical = tuple(sorted(v.index for v in path))
-                        if canonical not in seen_cycles:
-                            seen_cycles.add(canonical)
-                            cycles.append([v.index for v in path])
-                elif nbr.index not in visited:
-                    if len(path) < max_len:
-                        new_visited = visited.copy()
-                        new_visited.add(nbr.index)
-                        queue.append((nbr, path + [nbr], new_visited))
+        # 寻找在排除 v_start 后，任意两个邻居之间的最短路径
+        # 这能保证我们在 branching 严重的网络中瞬时定位到通过 v_start 的闭合圈
+        for i in range(len(neighbors)):
+            for j in range(i + 1, len(neighbors)):
+                w1 = neighbors[i]
+                w2 = neighbors[j]
+                
+                queue = collections.deque([[w1]])
+                visited = {v_start.index, w1.index}
+                found_path = None
+                
+                while queue:
+                    path = queue.popleft()
+                    curr = path[-1]
+                    
+                    if curr.index == w2.index:
+                        found_path = path
+                        break
                         
+                    if len(path) >= max_len:
+                        continue
+                        
+                    for e in curr.link_edges:
+                        if len(e.link_faces) <= 1:
+                            nbr = e.other_vert(curr)
+                            if nbr.index not in visited:
+                                visited.add(nbr.index)
+                                queue.append(path + [nbr])
+                                
+                if found_path:
+                    # 组合成闭合圈：v_start -> w1 -> ... -> w2 -> v_start
+                    cycle = [v_start] + found_path
+                    cycle_indices = [v.index for v in cycle]
+                    canonical = tuple(sorted(cycle_indices))
+                    if canonical not in seen_cycles:
+                        seen_cycles.add(canonical)
+                        cycles.append(cycle_indices)
+                        if len(cycles) >= max_cycles:
+                            break
+            if len(cycles) >= max_cycles:
+                break
+                
         cycles.sort(key=lambda c: len(c))
         return cycles
 
@@ -1142,11 +1264,50 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if edge_len < 0.001:
             edge_len = 0.001
             
+        log_lines = []
+        log_lines.append("--- Calling resample_stroke_segments ---")
+        log_lines.append(f"Original points count: {n}, edge_len: {edge_len}, is_closed: {is_closed}")
+        for i, p in enumerate(points):
+            log_lines.append(f"  Point {i}: {p} (snap: {snap_indices[i]})")
+            
         if is_closed:
             points = list(points)
             points[-1] = points[0]
             snap_indices = list(snap_indices)
             snap_indices[-1] = snap_indices[0]
+            
+        # Get reference object
+        ref_obj_name = getattr(self, 'ref_object_name', '')
+        if not ref_obj_name:
+            ref_obj_name = context.window_manager.tp_ref_object_name
+        ref_obj = bpy.data.objects.get(ref_obj_name)
+        log_lines.append(f"ref_obj_name: {ref_obj_name}, found ref_obj: {ref_obj is not None}")
+        
+        ref_matrix = None
+        ref_inverse = None
+        if ref_obj:
+            ref_matrix = ref_obj.matrix_world
+            ref_inverse = ref_matrix.inverted()
+            
+        # Get 2D region/view info for raycasting
+        region = context.region
+        rv3d = context.space_data.region_3d
+        
+        # Calculate boundaries
+        boundaries = []
+        if getattr(self, 'is_polyline', False):
+            log_lines.append("Polyline mode: treating all clicked points as corners (boundaries)")
+            for i in range(n):
+                boundaries.append((i, snap_indices[i]))
+        else:
+            log_lines.append("Drag mode: only snap points are boundaries")
+            boundaries.append((0, snap_indices[0]))
+            for i in range(1, n - 1):
+                if snap_indices[i] is not None:
+                    if snap_indices[i] != boundaries[-1][1]:
+                        boundaries.append((i, snap_indices[i]))
+            if n - 1 > boundaries[-1][0]:
+                boundaries.append((n - 1, snap_indices[-1]))
             
         start_snap_idx = snap_indices[0]
         end_snap_idx = snap_indices[-1]
@@ -1172,19 +1333,12 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 if topo_obj.mode != 'EDIT':
                     bm_temp.free()
             
-        boundaries = []
-        boundaries.append((0, snap_indices[0]))
-        for i in range(1, n - 1):
-            if snap_indices[i] is not None:
-                if snap_indices[i] != boundaries[-1][1]:
-                    boundaries.append((i, snap_indices[i]))
-        if n - 1 > boundaries[-1][0]:
-            boundaries.append((n - 1, snap_indices[-1]))
-            
         num_segs = len(boundaries) - 1
         seg_lengths = []
         seg_points = []
         seg_snap_indices = []
+        
+        import math
         
         for j in range(num_segs):
             start_idx = boundaries[j][0]
@@ -1192,6 +1346,52 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
             pts = points[start_idx : end_idx + 1]
             snaps = snap_indices[start_idx : end_idx + 1]
+            
+            # Densify this segment if there are large gaps (e.g. straight segments)
+            dense_pts = []
+            dense_snaps = []
+            for i in range(len(pts) - 1):
+                p_start = pts[i]
+                p_end = pts[i+1]
+                snap_start = snaps[i]
+                
+                dense_pts.append(p_start)
+                dense_snaps.append(snap_start)
+                
+                segment_dist = (p_end - p_start).length
+                if segment_dist > edge_len:
+                    step_size = edge_len / 4.0
+                    num_steps = int(math.ceil(segment_dist / step_size))
+                    log_lines.append(f"  Densifying sub-segment {i} of seg {j} ({segment_dist:.4f} > {edge_len:.4f}) with {num_steps} steps...")
+                    
+                    p_start_2d = location_3d_to_region_2d(region, rv3d, p_start)
+                    p_end_2d = location_3d_to_region_2d(region, rv3d, p_end)
+                    
+                    for s in range(1, num_steps):
+                        factor = s / num_steps
+                        pt_3d = None
+                        if p_start_2d and p_end_2d:
+                            pt_2d = p_start_2d.lerp(p_end_2d, factor)
+                            pt_3d = self.get_surface_point(context, pt_2d)
+                            
+                        if pt_3d is None:
+                            pt_3d = p_start.lerp(p_end, factor)
+                            if ref_obj and ref_matrix and ref_inverse:
+                                try:
+                                    local_target = ref_inverse @ pt_3d
+                                    success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
+                                    if success:
+                                        local_pt = location + normal * 0.003
+                                        pt_3d = ref_matrix @ local_pt
+                                except:
+                                    pass
+                        dense_pts.append(pt_3d)
+                        dense_snaps.append(None)
+            dense_pts.append(pts[-1])
+            dense_snaps.append(snaps[-1])
+            
+            pts = dense_pts
+            snaps = dense_snaps
             
             l_seg = 0.0
             for k in range(len(pts) - 1):
@@ -1227,6 +1427,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 E_target = max(1, total_initial_edges + diff)
         
         total_len = sum(seg_lengths)
+        log_lines.append(f"Total segment length (surface): {total_len:.4f}, E_target: {E_target}")
         if total_len < 0.001:
             distributed_edges = [max(1, E_target // num_segs)] * num_segs
             diff = E_target - sum(distributed_edges)
@@ -1322,6 +1523,16 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if is_closed:
             resampled_points[-1] = resampled_points[0]
             resampled_snap_indices[-1] = resampled_snap_indices[0]
+            
+        log_lines.append(f"Returning resampled_points count: {len(resampled_points)}")
+        for i, p in enumerate(resampled_points):
+            log_lines.append(f"  Final Point {i}: {p}")
+            
+        try:
+            with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f:
+                f.write("\n".join(log_lines) + "\n")
+        except:
+            pass
             
         return resampled_points, resampled_snap_indices
 
@@ -1683,11 +1894,15 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 target_v = bm.verts[self.grab_snap_target_idx]
                 
                 if active_v.is_valid and target_v.is_valid and active_v != target_v:
-                    active_v.co = target_v.co.copy()
-                    try:
-                        bmesh.ops.weld_verts(bm, targetmap={active_v: target_v})
-                    except Exception as e:
-                        print("Weld verts error:", e)
+                    pin_boundary = context.scene.tp_pin_boundary
+                    pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+                    is_active_pinned = pin_boundary and pin_layer and (active_v[pin_layer] == 1)
+                    if not is_active_pinned:
+                        active_v.co = target_v.co.copy()
+                        try:
+                            bmesh.ops.weld_verts(bm, targetmap={active_v: target_v})
+                        except Exception as e:
+                            print("Weld verts error:", e)
                         
             try:
                 bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
@@ -1707,7 +1922,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 print("Error pushing undo step:", e)
                 
             self.report({'INFO'}, "已确认位置并合并")
-            context.workspace.status_text_set("TP拓扑模式 | Ctrl+左键拖拽: 连续绘制 | Ctrl+左键单击: 绘制多段线 | Alt+左键: 选中圈/循环边 | 右键/回车: 提交 | ESC退出")
+            context.workspace.status_text_set("TP拓扑模式 | Ctrl+left-click drag: continuous draw | Ctrl+left-click single: draw segment | Alt+left-click: select loop | right-click/Enter: submit | ESC to exit")
             context.area.tag_redraw()
             return {'RUNNING_MODAL'}
             
@@ -1733,9 +1948,17 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
             delta_local = active_new_local - active_start_local
             
+            pin_boundary = context.scene.tp_pin_boundary
+            pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+            
             for v_idx, init_co in self.grab_initial_cos.items():
                 if v_idx < len(bm.verts):
-                    bm.verts[v_idx].co = init_co + delta_local
+                    v = bm.verts[v_idx]
+                    is_v_pinned = pin_boundary and pin_layer and (v[pin_layer] == 1)
+                    if is_v_pinned:
+                        v.co = init_co
+                    else:
+                        v.co = init_co + delta_local
             
             topo_world = topo_obj.matrix_world
             ref_matrix = ref_obj.matrix_world
@@ -1745,6 +1968,9 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 if v_idx < len(bm.verts):
                     v = bm.verts[v_idx]
                     if v_idx != self.grab_active_vert_idx:
+                        is_v_pinned = pin_boundary and pin_layer and (v[pin_layer] == 1)
+                        if is_v_pinned:
+                            continue
                         try:
                             world_co = topo_world @ v.co
                             local_target = ref_inverse @ world_co
@@ -1758,21 +1984,26 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             self.grab_snap_target_idx = None
             self.hover_snap_pt = None
             
-            try:
-                world_co = topo_world @ active_new_local
-                local_target = ref_inverse @ world_co
-                success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
-                if success:
-                    local_pt = location + normal * 0.003
-                    active_projected_world = ref_matrix @ local_pt
-                else:
+            is_active_pinned = pin_boundary and pin_layer and (active_v[pin_layer] == 1)
+            if is_active_pinned:
+                active_projected_world = topo_world @ active_start_local
+                active_v.co = active_start_local
+            else:
+                try:
+                    world_co = topo_world @ active_new_local
+                    local_target = ref_inverse @ world_co
+                    success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
+                    if success:
+                        local_pt = location + normal * 0.003
+                        active_projected_world = ref_matrix @ local_pt
+                    else:
+                        active_projected_world = world_co
+                except Exception:
                     active_projected_world = world_co
-            except Exception:
-                active_projected_world = world_co
-                
-            active_v.co = inv_topo_matrix @ active_projected_world
+                    
+                active_v.co = inv_topo_matrix @ active_projected_world
             
-            if self.kd_tree:
+            if self.kd_tree and not is_active_pinned:
                 try:
                     nearest = self.kd_tree.find_n(active_projected_world, 50)
                 except Exception:
@@ -1808,3 +2039,268 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             return {'RUNNING_MODAL'}
             
         return {'RUNNING_MODAL'}
+
+
+# --- Robust Boundary Pinning Mechanism ---
+_pinned_coords = {}          # Dictionary mapping vertex index to Vector
+_pinned_vertex_count = 0    # Tracks total vertices to detect topology changes
+_in_pin_handler = False      # Re-entrancy guard to prevent recursive updates
+_updating_ui = False        # Guard to prevent UI property syncing from altering vertex data
+
+def update_pinned_coordinates(context):
+    """
+    Finds all boundary vertices in the TP topology mesh and caches their current coordinates.
+    """
+    global _pinned_coords, _pinned_vertex_count
+    _pinned_coords.clear()
+    _pinned_vertex_count = 0
+    
+    topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+    if not topo_obj:
+        return
+        
+    import bmesh
+    
+    # Check mode and load geometry
+    if topo_obj.mode == 'EDIT':
+        bm = bmesh.from_edit_mesh(topo_obj.data)
+        bm.verts.ensure_lookup_table()
+        pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+        co_layer = bm.verts.layers.float_vector.get("tp_pinned_co")
+        if pin_layer and co_layer:
+            for v in bm.verts:
+                if v[pin_layer] == 1:
+                    _pinned_coords[v.index] = mathutils.Vector(v[co_layer])
+        _pinned_vertex_count = len(bm.verts)
+    else:
+        # In Object, Sculpt, or other modes
+        mesh = topo_obj.data
+        pin_attr = mesh.attributes.get("tp_is_pinned")
+        co_attr = mesh.attributes.get("tp_pinned_co")
+        if pin_attr and co_attr:
+            for i, v in enumerate(mesh.vertices):
+                if pin_attr.data[i].value == 1:
+                    _pinned_coords[i] = mathutils.Vector(co_attr.data[i].vector)
+        _pinned_vertex_count = len(mesh.vertices)
+
+def on_pin_boundary_update(self, context):
+    """
+    Callback triggered whenever context.scene.tp_pin_boundary is toggled.
+    Initializes or clears the boundary coordinates cache and sets sculpt masks if appropriate.
+    """
+    global _pinned_coords, _pinned_vertex_count, _updating_ui
+    if _updating_ui:
+        return
+        
+    topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+    if not topo_obj:
+        return
+        
+    pin_active = context.scene.tp_pin_boundary
+    import bmesh
+    is_edit = (topo_obj.mode == 'EDIT')
+    
+    # Get selected vertices
+    selected_indices = []
+    if is_edit:
+        bm = bmesh.from_edit_mesh(topo_obj.data)
+        bm.verts.ensure_lookup_table()
+        selected_indices = [v.index for v in bm.verts if v.select]
+    else:
+        selected_indices = [v.index for v in topo_obj.data.vertices if v.select]
+        
+    # Modify pin layer/attribute
+    if is_edit:
+        bm = bmesh.from_edit_mesh(topo_obj.data)
+        bm.verts.ensure_lookup_table()
+        pin_layer = bm.verts.layers.int.get("tp_is_pinned") or bm.verts.layers.int.new("tp_is_pinned")
+        co_layer = bm.verts.layers.float_vector.get("tp_pinned_co") or bm.verts.layers.float_vector.new("tp_pinned_co")
+        
+        if not selected_indices:
+            # Case A: No points selected - set/clear all boundary vertices
+            for v in bm.verts:
+                if v.is_boundary:
+                    v[pin_layer] = 1 if pin_active else 0
+                    v[co_layer] = v.co.copy()
+                else:
+                    v[pin_layer] = 0
+        else:
+            # Case B: Points selected - set/clear selected vertices only
+            for idx in selected_indices:
+                if idx < len(bm.verts):
+                    v = bm.verts[idx]
+                    v[pin_layer] = 1 if pin_active else 0
+                    v[co_layer] = v.co.copy()
+        bmesh.update_edit_mesh(topo_obj.data)
+    else:
+        mesh = topo_obj.data
+        pin_attr = mesh.attributes.get("tp_is_pinned") or mesh.attributes.new(name="tp_is_pinned", type='INT', domain='POINT')
+        co_attr = mesh.attributes.get("tp_pinned_co") or mesh.attributes.new(name="tp_pinned_co", type='FLOAT_VECTOR', domain='POINT')
+        
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        
+        if not selected_indices:
+            # Case A: No points selected
+            for v in bm.verts:
+                if v.is_boundary:
+                    pin_attr.data[v.index].value = 1 if pin_active else 0
+                    co_attr.data[v.index].vector = v.co.copy()
+                else:
+                    pin_attr.data[v.index].value = 0
+        else:
+            # Case B: Points selected
+            for idx in selected_indices:
+                if idx < len(mesh.vertices):
+                    pin_attr.data[idx].value = 1 if pin_active else 0
+                    co_attr.data[idx].vector = mesh.vertices[idx].co.copy()
+        bm.free()
+        mesh.update()
+        
+    # Rebuild coordinates cache and update masks
+    update_pinned_coordinates(context)
+    
+    # If in Sculpt mode, synchronize sculpt masks
+    if topo_obj.mode == 'SCULPT':
+        mesh = topo_obj.data
+        mask_attr = mesh.attributes.get("mask") or mesh.attributes.new(name="mask", type='FLOAT', domain='POINT')
+        for item in mask_attr.data:
+            item.value = 0.0
+        for idx in _pinned_coords.keys():
+            if idx < len(mask_attr.data):
+                mask_attr.data[idx].value = 1.0
+        mesh.update()
+
+def tp_pin_depsgraph_handler(scene, depsgraph=None):
+    """
+    Global depsgraph update handler to enforce the boundary coordinates locking.
+    Locks vertices in both Edit Mode and Sculpt Mode, and ensures proper mask protection in Sculpt Mode.
+    """
+    global _in_pin_handler, _pinned_coords, _pinned_vertex_count, _updating_ui
+    if _in_pin_handler:
+        return
+        
+    topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+    if not topo_obj:
+        return
+        
+    import bmesh
+    is_edit = (topo_obj.mode == 'EDIT')
+    
+    # 1. UI State Synchronization (runs always to keep button in sync with active selection)
+    is_pinned = False
+    if is_edit:
+        try:
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            selected_verts = [v for v in bm.verts if v.select]
+            if selected_verts:
+                active_v = bm.select_history.active
+                if active_v and isinstance(active_v, bmesh.types.BMVert) and active_v.select:
+                    target_v = active_v
+                else:
+                    target_v = selected_verts[0]
+                pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+                if pin_layer and target_v[pin_layer] == 1:
+                    is_pinned = True
+            else:
+                pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+                if pin_layer:
+                    boundary_verts = [v for v in bm.verts if v.is_boundary]
+                    if boundary_verts:
+                        is_pinned = all(v[pin_layer] == 1 for v in boundary_verts)
+        except Exception:
+            pass
+    else:
+        mesh = topo_obj.data
+        selected_indices = [v.index for v in mesh.vertices if v.select]
+        pin_attr = mesh.attributes.get("tp_is_pinned")
+        if pin_attr:
+            if selected_indices:
+                idx = selected_indices[0]
+                if pin_attr.data[idx].value == 1:
+                    is_pinned = True
+            else:
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                bm.verts.ensure_lookup_table()
+                boundary_indices = [v.index for v in bm.verts if v.is_boundary]
+                bm.free()
+                if boundary_indices:
+                    is_pinned = all(pin_attr.data[idx].value == 1 for idx in boundary_indices)
+                    
+    if scene.tp_pin_boundary != is_pinned:
+        _updating_ui = True
+        try:
+            scene.tp_pin_boundary = is_pinned
+        finally:
+            _updating_ui = False
+            
+    # 2. Coordinates Enforcement (only runs if scene.tp_pin_boundary is True)
+    if not scene.tp_pin_boundary:
+        return
+        
+    # Get the current vertex count to check for topology changes
+    current_count = 0
+    if is_edit:
+        try:
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            current_count = len(bm.verts)
+        except Exception:
+            return
+    else:
+        current_count = len(topo_obj.data.vertices)
+        
+    # If topology changed, rebuild the pinning coordinates at their current position
+    if current_count != _pinned_vertex_count or not _pinned_coords:
+        _in_pin_handler = True
+        try:
+            update_pinned_coordinates(bpy.context)
+        finally:
+            _in_pin_handler = False
+        return
+        
+    # Enforce boundary coordinates
+    _in_pin_handler = True
+    try:
+        changed = False
+        
+        if is_edit:
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            bm.verts.ensure_lookup_table()
+            for idx, co in _pinned_coords.items():
+                if idx < len(bm.verts):
+                    v = bm.verts[idx]
+                    if (v.co - co).length > 1e-5:
+                        v.co = co.copy()
+                        changed = True
+            if changed:
+                bmesh.update_edit_mesh(topo_obj.data)
+        else:
+            mesh = topo_obj.data
+            for idx, co in _pinned_coords.items():
+                if idx < len(mesh.vertices):
+                    v = mesh.vertices[idx]
+                    if (v.co - co).length > 1e-5:
+                        v.co = co.copy()
+                        changed = True
+            
+            # Enforce sculpt mode masking
+            if topo_obj.mode == 'SCULPT':
+                mask_attr = mesh.attributes.get("mask")
+                if not mask_attr:
+                    mask_attr = mesh.attributes.new(name="mask", type='FLOAT', domain='POINT')
+                for idx in _pinned_coords.keys():
+                    if idx < len(mask_attr.data):
+                        item = mask_attr.data[idx]
+                        if item.value != 1.0:
+                            item.value = 1.0
+                            changed = True
+            if changed:
+                mesh.update()
+                
+    except Exception as e:
+        print("Error enforcing boundary pin:", e)
+    finally:
+        _in_pin_handler = False
+
