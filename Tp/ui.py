@@ -18,6 +18,7 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
         is_enabled = wm.tp_topology_running or is_mesh
         
         col.prop(scene, "tp_edge_length", text="边长")
+        col.prop(scene, "tp_smooth_factor", text="平滑力度")
         col.separator()
         
         row = col.row(align=True)

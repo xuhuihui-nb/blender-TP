@@ -1503,6 +1503,12 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 bm.free()
             return
             
+        factor = getattr(context.scene, "tp_smooth_factor", 0.05)
+        if factor < 0.001:
+            if not is_edit_mode:
+                bm.free()
+            return
+            
         ref_obj = bpy.data.objects.get(self.ref_object_name)
         if ref_obj:
             matrix_world = ref_obj.matrix_world
@@ -1510,8 +1516,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             topo_inverse = topo_obj.matrix_world.inverted()
             topo_world = topo_obj.matrix_world
             
-            iterations = 4
-            factor = 0.12
+            iterations = 2
             for iteration in range(iterations):
                 new_cos = {}
                 for v in val2_verts:

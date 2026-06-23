@@ -1,8 +1,8 @@
 bl_info = {
     "name": "TP拓扑",
     "author": "huihui-nb",
-    "version": (1, 0, 3),
-    "blender": (3, 0, 0),
+    "version": (1, 0, 4),
+    "blender": (5, 0, 1),
     "location": "View3D > Sidebar > TP拓扑",
     "description": "在被选网格对象表面绘制连续拓扑线的工具",
     "warning": "",
@@ -52,6 +52,15 @@ def register():
         precision=3,
         step=1.0
     )
+    bpy.types.Scene.tp_smooth_factor = bpy.props.FloatProperty(
+        name="平滑力度",
+        description="绘制结束后对线条进行自动平滑的强度 (0为不平滑)",
+        default=0.05,
+        min=0.0,
+        max=1.0,
+        precision=2,
+        step=5.0
+    )
     bpy.types.Scene.tp_grid_decay = bpy.props.FloatProperty(
         name="栅格渐变比例",
         description="控制网格从外圈到内圈的尺寸收缩渐变程度 (0为无渐变)",
@@ -68,6 +77,7 @@ def unregister():
     del bpy.types.WindowManager.tp_topology_running
     del bpy.types.WindowManager.tp_ref_object_name
     del bpy.types.Scene.tp_edge_length
+    del bpy.types.Scene.tp_smooth_factor
     del bpy.types.Scene.tp_grid_decay
 
 if __name__ == "__main__":
