@@ -226,6 +226,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         self.last_ctrl_state = False
         self.start_from_selected_v_co = None
         self.start_from_selected_v_idx = None
+        self.max_drag_dist_from_start = 0.0
         
         ref_obj.hide_select = True
         ref_obj.select_set(False)
@@ -761,6 +762,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     self.is_polyline = False
                     self.stroke_points = [pt]
                     self.stroke_snap_indices = [snap_v]
+                    self.max_drag_dist_from_start = 0.0
                     context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
                 
@@ -780,7 +782,58 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                         if (pt - self.stroke_points[-1]).length > 0.001:
                             self.stroke_points.append(pt)
                             self.stroke_snap_indices.append(snap_v)
-                            context.area.tag_redraw()
+                            
+                            # 检测新加入的点是否使圈线闭合
+                            is_closed = False
+                            if len(self.stroke_points) >= 3:
+                                start_snap = self.stroke_snap_indices[0] if (self.stroke_snap_indices and len(self.stroke_snap_indices) > 0) else None
+                                end_snap = self.stroke_snap_indices[-1] if (self.stroke_snap_indices and len(self.stroke_snap_indices) > 1) else None
+                                if start_snap is not None and end_snap is not None:
+                                    if start_snap == end_snap:
+                                        is_closed = True
+                                    else:
+                                        # 检测在已有网格中是否存在连接这两个顶点的路径
+                                        topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+                                        if topo_obj and topo_obj.mode == 'EDIT':
+                                            try:
+                                                bm = bmesh.from_edit_mesh(topo_obj.data)
+                                                bm.verts.ensure_lookup_table()
+                                                if start_snap < len(bm.verts) and end_snap < len(bm.verts):
+                                                    v_start = bm.verts[start_snap]
+                                                    v_end = bm.verts[end_snap]
+                                                    path = self.find_shortest_path_edges_in_bm(bm, v_start, v_end)
+                                                    if path is not None:
+                                                        is_closed = True
+                                            except Exception as e:
+                                                print("Error checking path in BM:", e)
+                                                
+                                if not is_closed:
+                                    region = context.region
+                                    rv3d = context.space_data.region_3d
+                                    p0_2d = location_3d_to_region_2d(region, rv3d, self.stroke_points[0])
+                                    pn_2d = location_3d_to_region_2d(region, rv3d, self.stroke_points[-1])
+                                    if p0_2d and pn_2d:
+                                        if (p0_2d - pn_2d).length < 20:
+                                            is_closed = True
+                                            
+                            if is_closed:
+                                if len(self.stroke_points) >= 2:
+                                    self.create_geometry(context)
+                                    try:
+                                        bpy.ops.ed.undo_push(message="TP 拓扑绘制")
+                                    except Exception as e:
+                                        print("Error pushing undo step:", e)
+                                    self.report({'INFO'}, "已闭合圈线并自动完成绘制")
+                                self.stroke_points = []
+                                self.stroke_snap_indices = []
+                                self.is_drawing = False
+                                self.is_polyline = False
+                                self.start_from_selected_v_co = None
+                                self.start_from_selected_v_idx = None
+                                self.max_drag_dist_from_start = 0.0
+                                context.area.tag_redraw()
+                            else:
+                                context.area.tag_redraw()
                     return {'RUNNING_MODAL'}
                     
                 return {'RUNNING_MODAL'}
@@ -798,7 +851,68 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                     self.stroke_points.append(pt)
                                     self.stroke_snap_indices.append(snap_v)
                                     self.last_mouse_coord_prev = coord
-                                    context.area.tag_redraw()
+                                    
+                                    # 在连续绘制（拖拽）过程中，检测是否首尾闭合
+                                    region = context.region
+                                    rv3d = context.space_data.region_3d
+                                    p0_2d = location_3d_to_region_2d(region, rv3d, self.stroke_points[0])
+                                    pn_2d = location_3d_to_region_2d(region, rv3d, pt)
+                                    
+                                    if p0_2d and pn_2d:
+                                        # 计算新点到起点的距离，并更新最大拉伸距离
+                                        dist_from_start = (pn_2d - p0_2d).length
+                                        if dist_from_start > self.max_drag_dist_from_start:
+                                            self.max_drag_dist_from_start = dist_from_start
+                                            
+                                        # 只有当路径曾经离开起点超过 30 像素，才进行闭合判定
+                                        is_closed = False
+                                        if len(self.stroke_points) >= 3 and self.max_drag_dist_from_start > 30:
+                                            start_snap = self.stroke_snap_indices[0] if (self.stroke_snap_indices and len(self.stroke_snap_indices) > 0) else None
+                                            end_snap = self.stroke_snap_indices[-1] if (self.stroke_snap_indices and len(self.stroke_snap_indices) > 1) else None
+                                            if start_snap is not None and end_snap is not None:
+                                                if start_snap == end_snap:
+                                                    is_closed = True
+                                                else:
+                                                    # 检测在已有网格中是否存在连接这两个顶点的路径
+                                                    topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+                                                    if topo_obj and topo_obj.mode == 'EDIT':
+                                                        try:
+                                                            bm = bmesh.from_edit_mesh(topo_obj.data)
+                                                            bm.verts.ensure_lookup_table()
+                                                            if start_snap < len(bm.verts) and end_snap < len(bm.verts):
+                                                                v_start = bm.verts[start_snap]
+                                                                v_end = bm.verts[end_snap]
+                                                                path = self.find_shortest_path_edges_in_bm(bm, v_start, v_end)
+                                                                if path is not None:
+                                                                    is_closed = True
+                                                        except Exception as e:
+                                                            print("Error checking path in BM:", e)
+                                                            
+                                            if not is_closed:
+                                                if dist_from_start < 20:
+                                                    is_closed = True
+                                                    
+                                        if is_closed:
+                                            if len(self.stroke_points) >= 2:
+                                                self.create_geometry(context)
+                                                try:
+                                                    bpy.ops.ed.undo_push(message="TP 拓扑绘制")
+                                                except Exception as e:
+                                                    print("Error pushing undo step:", e)
+                                                self.report({'INFO'}, "已闭合圈线并自动完成绘制")
+                                            self.stroke_points = []
+                                            self.stroke_snap_indices = []
+                                            self.is_drawing = False
+                                            self.is_dragging = False
+                                            self.is_polyline = False
+                                            self.start_from_selected_v_co = None
+                                            self.start_from_selected_v_idx = None
+                                            self.max_drag_dist_from_start = 0.0
+                                            context.area.tag_redraw()
+                                        else:
+                                            context.area.tag_redraw()
+                                    else:
+                                        context.area.tag_redraw()
                         return {'RUNNING_MODAL'}
                         
                 elif event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
