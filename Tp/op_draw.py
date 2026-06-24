@@ -206,6 +206,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         self.is_drawing = False
         self.is_dragging = False
         self.is_polyline = False
+        self.is_outside_drawing = False
         self.is_grabbing = False
         self.grab_initial_cos = {}
         self.grab_active_vert_idx = None
@@ -620,6 +621,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     self.stroke_snap_indices = []
                     self.is_drawing = False
                     self.is_polyline = False
+                    self.is_outside_drawing = False
                     self.start_from_selected_v_co = None
                     self.start_from_selected_v_idx = None
                     self.report({'INFO'}, "已取消绘制")
@@ -763,6 +765,16 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     self.stroke_points = [pt]
                     self.stroke_snap_indices = [snap_v]
                     self.max_drag_dist_from_start = 0.0
+                    self.is_outside_drawing = False
+                    context.area.tag_redraw()
+                else:
+                    self.is_drawing = True
+                    self.is_dragging = True
+                    self.is_polyline = False
+                    self.stroke_points = []
+                    self.stroke_snap_indices = []
+                    self.max_drag_dist_from_start = 0.0
+                    self.is_outside_drawing = True
                     context.area.tag_redraw()
                 return {'RUNNING_MODAL'}
                 
@@ -840,6 +852,10 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             else:
                 if event.type == 'MOUSEMOVE':
                     if self.is_dragging:
+                        if getattr(self, 'is_outside_drawing', False):
+                            self.last_mouse_coord = (event.mouse_region_x, event.mouse_region_y)
+                            context.area.tag_redraw()
+                            return {'RUNNING_MODAL'}
                         coord = (event.mouse_region_x, event.mouse_region_y)
                         dx = coord[0] - self.last_mouse_coord_prev[0]
                         dy = coord[1] - self.last_mouse_coord_prev[1]
@@ -920,6 +936,20 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     dx = coord[0] - self.drag_start_coord[0]
                     dy = coord[1] - self.drag_start_coord[1]
                     click_dist = (dx*dx + dy*dy) ** 0.5
+                    
+                    if getattr(self, 'is_outside_drawing', False):
+                        self.is_dragging = False
+                        self.is_drawing = False
+                        self.is_outside_drawing = False
+                        if click_dist >= 8:
+                            self.create_outside_drag_geometry(context, self.drag_start_coord, coord)
+                        self.stroke_points = []
+                        self.stroke_snap_indices = []
+                        self.is_polyline = False
+                        self.start_from_selected_v_co = None
+                        self.start_from_selected_v_idx = None
+                        context.area.tag_redraw()
+                        return {'RUNNING_MODAL'}
                     
                     if click_dist < 8:
                         self.is_polyline = True
@@ -1674,9 +1704,10 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     if (p0_2d - pn_2d).length < 20:
                         is_closed = True
                         
-        self.stroke_points, self.stroke_snap_indices = self.resample_stroke_segments(
-            context, self.stroke_points, self.stroke_snap_indices, is_closed
-        )
+        if not getattr(self, 'bypass_resample', False):
+            self.stroke_points, self.stroke_snap_indices = self.resample_stroke_segments(
+                context, self.stroke_points, self.stroke_snap_indices, is_closed
+            )
 
         curr_indices = []
 
@@ -1807,6 +1838,188 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 bm.select_history.add(last_v)
             bmesh.update_edit_mesh(topo_obj.data)
 
+    def create_outside_drag_geometry(self, context, start_2d, end_2d):
+        import math
+        ref_obj = bpy.data.objects.get(self.ref_object_name)
+        if not ref_obj:
+            return
+            
+        region = context.region
+        rv3d = context.space_data.region_3d
+        
+        # Calculate screen distance and number of samples
+        dx = end_2d[0] - start_2d[0]
+        dy = end_2d[1] - start_2d[1]
+        dist_px = (dx*dx + dy*dy) ** 0.5
+        if dist_px < 8:
+            return
+            
+        # Sample every 5 pixels, minimum 50 samples for smooth silhouette tracing
+        num_samples = max(50, int(dist_px / 5.0))
+        
+        matrix_world = ref_obj.matrix_world
+        matrix_inverse = matrix_world.inverted()
+        
+        # Dynamic far distance based on object dimensions to ensure we are well outside the object for the back raycast
+        far_dist = max(5.0, ref_obj.dimensions.length * 2.0)
+        
+        front_pts = [None] * (num_samples + 1)
+        back_pts = [None] * (num_samples + 1)
+        hits = [False] * (num_samples + 1)
+        
+        start_vec = mathutils.Vector(start_2d)
+        end_vec = mathutils.Vector(end_2d)
+        
+        depsgraph = context.evaluated_depsgraph_get()
+        
+        for i in range(num_samples + 1):
+            factor = i / num_samples
+            pt_2d = start_vec.lerp(end_vec, factor)
+            
+            ray_origin = region_2d_to_origin_3d(region, rv3d, pt_2d)
+            ray_vector = region_2d_to_vector_3d(region, rv3d, pt_2d)
+            
+            ray_origin_local = matrix_inverse @ ray_origin
+            ray_vector_local = matrix_inverse.to_3x3() @ ray_vector
+            
+            # Cast from front
+            try:
+                success_front, loc_front, norm_front, face_front = ref_obj.ray_cast(
+                    ray_origin_local,
+                    ray_vector_local,
+                    depsgraph=depsgraph
+                )
+            except Exception:
+                try:
+                    success_front, loc_front, norm_front, face_front = ref_obj.ray_cast(
+                        ray_origin_local,
+                        ray_vector_local
+                    )
+                except Exception:
+                    success_front = False
+            
+            if success_front:
+                # Cast from back, starting from the front intersection point plus far_dist along the ray
+                ray_origin_back = loc_front + ray_vector_local * far_dist
+                try:
+                    success_back, loc_back, norm_back, face_back = ref_obj.ray_cast(
+                        ray_origin_back,
+                        -ray_vector_local,
+                        depsgraph=depsgraph
+                    )
+                except Exception:
+                    try:
+                        success_back, loc_back, norm_back, face_back = ref_obj.ray_cast(
+                            ray_origin_back,
+                            -ray_vector_local
+                        )
+                    except Exception:
+                        success_back = False
+                        
+                if success_back:
+                    local_pt_front = loc_front + norm_front * 0.003
+                    world_pt_front = matrix_world @ local_pt_front
+                    
+                    local_pt_back = loc_back + norm_back * 0.003
+                    world_pt_back = matrix_world @ local_pt_back
+                    
+                    front_pts[i] = world_pt_front
+                    back_pts[i] = world_pt_back
+                    hits[i] = True
+                    
+        # Find continuous segments of hits
+        segments = []
+        in_segment = False
+        seg_start = -1
+        
+        for i in range(num_samples + 1):
+            if hits[i]:
+                if not in_segment:
+                    in_segment = True
+                    seg_start = i
+            else:
+                if in_segment:
+                    in_segment = False
+                    segments.append((seg_start, i - 1))
+        if in_segment:
+            segments.append((seg_start, num_samples))
+            
+        # Helper function for path resampling
+        def resample_path(points, target_edge_len):
+            n_pts = len(points)
+            if n_pts < 2:
+                return points
+            path_dists = [0.0]
+            for idx_p in range(n_pts - 1):
+                path_dists.append(path_dists[-1] + (points[idx_p+1] - points[idx_p]).length)
+            total_path_len = path_dists[-1]
+            if total_path_len < 0.001:
+                return [points[0]]
+            n_segs = max(1, round(total_path_len / target_edge_len))
+            resampled_pts = []
+            for idx_s in range(n_segs + 1):
+                t_d = (idx_s / n_segs) * total_path_len
+                found_idx = 1
+                for idx_k in range(1, len(path_dists)):
+                    if path_dists[idx_k] >= t_d:
+                        found_idx = idx_k
+                        break
+                d_s = path_dists[found_idx-1]
+                d_e = path_dists[found_idx]
+                s_len = d_e - d_s
+                f_factor = (t_d - d_s) / s_len if s_len > 0.0 else 0.0
+                p_new = points[found_idx-1].lerp(points[found_idx], f_factor)
+                resampled_pts.append(p_new)
+            return resampled_pts
+            
+        # For each segment, construct a closed loop and create geometry
+        geom_created = False
+        for seg_start_idx, seg_end_idx in segments:
+            # We want at least a few points to make a valid loop
+            if seg_end_idx - seg_start_idx < 2:
+                continue
+                
+            seg_front = front_pts[seg_start_idx : seg_end_idx + 1]
+            seg_back = back_pts[seg_start_idx : seg_end_idx + 1]
+            
+            edge_len = context.scene.tp_edge_length
+            if edge_len < 0.001:
+                edge_len = 0.001
+                
+            # Resample front and back paths independently along the surface
+            resampled_front = resample_path(seg_front, edge_len)
+            resampled_back = resample_path(seg_back, edge_len)
+            
+            # Resample the transition paths (silhouette edges) as well
+            transition_end = resample_path([resampled_front[-1], resampled_back[-1]], edge_len)
+            transition_start = resample_path([resampled_back[0], resampled_front[0]], edge_len)
+            
+            # Construct closed loop: front path -> transition end -> reversed back path -> transition start -> close
+            loop_points = []
+            loop_points.extend(resampled_front)
+            if len(transition_end) > 2:
+                loop_points.extend(transition_end[1:-1])
+            loop_points.extend(reversed(resampled_back))
+            if len(transition_start) > 2:
+                loop_points.extend(transition_start[1:-1])
+            loop_points.append(resampled_front[0])  # Close the loop
+            
+            self.stroke_points = loop_points
+            self.stroke_snap_indices = [None] * len(loop_points)
+            self.is_polyline = False  # Ensured to trigger smoothing and conforming
+            self.bypass_resample = True  # Avoid double-resampling and clustering
+            
+            self.create_geometry(context)
+            self.bypass_resample = False  # Reset flag
+            geom_created = True
+            
+        if geom_created:
+            try:
+                bpy.ops.ed.undo_push(message="TP 包围拓扑绘制")
+            except Exception as e:
+                print("Error pushing undo step:", e)
+            self.report({'INFO'}, "已生成包围拓扑线")
+
     def resample_loops(self, context, topo_obj, active_indices=None):
         is_edit_mode = (topo_obj.mode == 'EDIT')
         
@@ -1873,6 +2086,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             context.window_manager.tp_topology_running = False
         except Exception:
             pass
+        self.is_outside_drawing = False
 
         # 还原用户的吸附设置
         try:

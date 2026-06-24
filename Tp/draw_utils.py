@@ -276,3 +276,24 @@ def draw_text_callback(self, context):
                     blf.color(font_id, color[0], color[1], color[2], color[3])
                     blf.position(font_id, x, y, 0)
                     blf.draw(font_id, text)
+
+    # 4. Draw 2D straight line guide for outside drag
+    if getattr(self, 'is_outside_drawing', False):
+        shader = get_shader_2d()
+        if shader:
+            shader.bind()
+            shader.uniform_float("color", (1.0, 0.6, 0.0, 0.8))
+            try:
+                gpu.state.line_width_set(3.0)
+            except Exception:
+                pass
+            
+            start_coord = self.drag_start_coord
+            end_coord = self.last_mouse_coord
+            coords = [start_coord, end_coord]
+            try:
+                batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
+                batch.draw(shader)
+            except Exception:
+                pass
+
