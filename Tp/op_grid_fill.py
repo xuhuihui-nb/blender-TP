@@ -2,6 +2,7 @@ import bpy
 import bmesh
 import mathutils
 from mathutils import Vector
+import math
 
 def check_is_grid_filled(bm, loop_verts, cycle_edges):
     """
@@ -335,10 +336,439 @@ def trace_cycle_verts(cycle_edges):
     return loop
 
 
+def find_shared_paths(V_i, V_j):
+    """
+    找出两个循环顶点列表 V_i 和 V_j 之间的所有共享连通路径。
+    每个路径是一个按 V_i 中顺序排列 of BMVert 列表。
+    """
+    set_j = set(V_j)
+    n = len(V_i)
+    is_shared = [v in set_j for v in V_i]
+    
+    if not any(is_shared):
+        return []
+        
+    # 寻找所有连续的 True 区间
+    visited = set()
+    runs = []
+    for start in range(n):
+        if is_shared[start] and start not in visited:
+            run = [start]
+            visited.add(start)
+            curr = (start + 1) % n
+            while is_shared[curr] and curr not in visited:
+                run.append(curr)
+                visited.add(curr)
+                curr = (curr + 1) % n
+            runs.append(run)
+            
+    # 如果有多个区间，且第一个区间包含 0，最后一个区间包含 n-1，说明它们跨越了起点，需要合并
+    if len(runs) > 1:
+        first = runs[0]
+        last = runs[-1]
+        if first[0] == 0 and last[-1] == n - 1:
+            merged = last + first
+            runs = runs[1:-1] + [merged]
+            
+    # 转换索引为顶点列表，且只保留边数 >= 1 的路径（即顶点数 >= 2）
+    paths = []
+    for run in runs:
+        if len(run) >= 2:
+            path_verts = [V_i[idx] for idx in run]
+            paths.append(path_verts)
+    return paths
+
+
+def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_obj):
+    """
+    全局求解拼接圈各子网格的最佳划分参数 (M, N, offset)，使得相邻网格共享边界的 corners 对齐，
+    网格流向上下承接，且各个子网格自身的长宽比和角点形态最优。
+    """
+    num_cycles = len(cycles_verts)
+    if num_cycles == 0:
+        return []
+        
+    # 1. 预计算每个子圈的所有候选参数和其个体评分
+    cycle_candidates = []
+    for i, loop_verts in enumerate(cycles_verts):
+        L = len(loop_verts)
+        candidates = []
+        interior_angles = compute_loop_interior_angles(loop_verts, ref_obj, topo_obj)
+        
+        half_L = L // 2
+        coords = [v.co for v in loop_verts]
+        
+        # M 和 N 都必须至少为 2
+        for M in range(2, half_L - 1):
+            N = half_L - M
+            for offset in range(L):
+                i0 = offset
+                i1 = (offset + M) % L
+                i2 = (offset + M + N) % L
+                i3 = (offset + 2 * M + N) % L
+                
+                p0, p1, p2, p3 = coords[i0], coords[i1], coords[i2], coords[i3]
+                a, b, c, d = p1 - p0, p2 - p1, p3 - p2, p0 - p3
+                a_len, b_len, c_len, d_len = a.length, b.length, c.length, d.length
+                
+                if a_len < 1e-6 or b_len < 1e-6 or c_len < 1e-6 or d_len < 1e-6:
+                    continue
+                    
+                # 正交偏离度
+                cos0 = abs(d.dot(a) / (d_len * a_len))
+                cos1 = abs(a.dot(b) / (a_len * b_len))
+                cos2 = abs(b.dot(c) / (b_len * c_len))
+                cos3 = abs(c.dot(d) / (c_len * d_len))
+                ortho_score = cos0 + cos1 + cos2 + cos3
+                
+                # 长宽比偏离度
+                avg_len_x = (a_len + c_len) / (2.0 * M)
+                avg_len_y = (b_len + d_len) / (2.0 * N)
+                
+                if avg_len_y > 1e-6 and avg_len_x > 1e-6:
+                    ratio = avg_len_x / avg_len_y
+                    aspect_score = max(ratio, 1.0 / ratio) - 1.0
+                else:
+                    aspect_score = 9999.0
+                    
+                # 角度惩罚项
+                penalty = 0.0
+                corners = {i0, i1, i2, i3}
+                for j in range(L):
+                    angle = interior_angles[j]
+                    if angle < 90.0:
+                        if j not in corners:
+                            penalty += 1000.0
+                    elif angle > 180.0:
+                        if j in corners:
+                            penalty += 1000.0
+                            
+                score = ortho_score + 2.0 * aspect_score + penalty
+                candidates.append({
+                    'M': M, 'N': N, 'offset': offset,
+                    'score': score,
+                    'corners': [loop_verts[i0], loop_verts[i1], loop_verts[i2], loop_verts[i3]]
+                })
+                
+        candidates.sort(key=lambda x: x['score'])
+        # 保留前 40 个最优秀的个体作为候选，既保证求解质量，又限制搜索树宽度
+        cycle_candidates.append(candidates[:40])
+        
+    # 2. 决定回溯搜索的圈拓扑顺序 (BFS 连通树构建)
+    visited = set()
+    order = []
+    degrees = [0] * num_cycles
+    for sb in shared_boundaries:
+        degrees[sb['cycle_a']] += 1
+        degrees[sb['cycle_b']] += 1
+        
+    start_cycle = degrees.index(max(degrees)) if degrees else 0
+    order.append(start_cycle)
+    visited.add(start_cycle)
+    
+    while len(order) < num_cycles:
+        best_next = None
+        max_shared = -1
+        for i in range(num_cycles):
+            if i in visited:
+                continue
+            conn = sum(1 for sb in shared_boundaries if (sb['cycle_a'] == i and sb['cycle_b'] in visited) or (sb['cycle_b'] == i and sb['cycle_a'] in visited))
+            if conn > max_shared:
+                max_shared = conn
+                best_next = i
+        if best_next is not None:
+            order.append(best_next)
+            visited.add(best_next)
+        else:
+            for i in range(num_cycles):
+                if i not in visited:
+                    order.append(i)
+                    visited.add(i)
+                    break
+                    
+    # 3. 辅助函数：判断共享边界的两个端点是否是候选网格的 corners，并获取 side 序号与类型
+    def get_shared_side_and_type(cand, u, w):
+        corners = cand['corners']
+        try:
+            idx_u = corners.index(u)
+            idx_w = corners.index(w)
+        except ValueError:
+            return -1, None
+            
+        diff = abs(idx_u - idx_w)
+        if diff == 1 or diff == 3:
+            if (idx_u == 0 and idx_w == 1) or (idx_u == 1 and idx_w == 0):
+                return 0, 'horizontal'
+            elif (idx_u == 1 and idx_w == 2) or (idx_u == 2 and idx_w == 1):
+                return 1, 'vertical'
+            elif (idx_u == 2 and idx_w == 3) or (idx_u == 3 and idx_w == 2):
+                return 2, 'horizontal'
+            else:
+                return 3, 'vertical'
+        return -1, None
+        
+    # 4. 回溯搜索最优全局参数组合
+    best_global_score = float('inf')
+    best_global_params = [None] * num_cycles
+    
+    def search(depth, current_params, current_score):
+        nonlocal best_global_score, best_global_params
+        
+        if current_score >= best_global_score:
+            return
+            
+        if depth == num_cycles:
+            if current_score < best_global_score:
+                best_global_score = current_score
+                best_global_params = list(current_params)
+            return
+            
+        curr_idx = order[depth]
+        active_boundaries = []
+        for sb in shared_boundaries:
+            if sb['cycle_a'] == curr_idx and current_params[sb['cycle_b']] is not None:
+                active_boundaries.append((sb, sb['cycle_b']))
+            elif sb['cycle_b'] == curr_idx and current_params[sb['cycle_a']] is not None:
+                active_boundaries.append((sb, sb['cycle_a']))
+                
+        for cand in cycle_candidates[curr_idx]:
+            compat_cost = 0.0
+            aligned = True
+            
+            for sb, neighbor_idx in active_boundaries:
+                neighbor_cand = current_params[neighbor_idx]
+                u, w = sb['endpoints']
+                
+                neighbor_side, neighbor_type = get_shared_side_and_type(neighbor_cand, u, w)
+                curr_side, curr_type = get_shared_side_and_type(cand, u, w)
+                
+                if neighbor_side == -1 or curr_side == -1:
+                    # 边界端点与网格角点没有完全对齐，给予惩罚
+                    compat_cost += 10000.0
+                    aligned = False
+                else:
+                    # 检查横纵类型是否一致
+                    if neighbor_type != curr_type:
+                        compat_cost += 5000.0
+                    else:
+                        # 检查流向是否上下承接（Side 0 承接 Side 2，Side 1 承接 Side 3）
+                        perfect_match = False
+                        if neighbor_side == 2 and curr_side == 0: perfect_match = True
+                        elif neighbor_side == 0 and curr_side == 2: perfect_match = True
+                        elif neighbor_side == 1 and curr_side == 3: perfect_match = True
+                        elif neighbor_side == 3 and curr_side == 1: perfect_match = True
+                        
+                        if not perfect_match:
+                            compat_cost += 500.0  # 流向反向或错位，但轴向相同，给小惩罚
+                            
+            if active_boundaries and not aligned and current_score + compat_cost >= best_global_score:
+                continue
+                
+            next_score = current_score + cand['score'] + compat_cost
+            current_params[curr_idx] = cand
+            search(depth + 1, current_params, next_score)
+            current_params[curr_idx] = None
+            
+    initial_params = [None] * num_cycles
+    search(0, initial_params, 0.0)
+    
+    # 兜底保障
+    if best_global_params[0] is None:
+        for i in range(num_cycles):
+            if cycle_candidates[i]:
+                best_global_params[i] = cycle_candidates[i][0]
+                
+    return [(p['M'], p['N'], p['offset']) if p else None for p in best_global_params]
+
+
+def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3):
+    """
+    对网格中所有已填充的拼接栅格区域进行全局拓扑优化（整体调优）。
+    保持最外层边界点不动，释放所有内部顶点以及不同栅格区域之间的共享边界顶点，
+    通过拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热 + 贴合投影 + 物理边界碰撞，
+    使得所有拼接的栅格过渡平滑自然。
+    """
+    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+    if not grid_layer:
+        return
+        
+    grid_faces = [f for f in bm.faces if f[grid_layer] > 0]
+    if not grid_faces:
+        return
+        
+    # 1. 划分连通分支
+    visited_faces = set()
+    components = []
+    for f in grid_faces:
+        if f in visited_faces:
+            continue
+        comp_faces = []
+        queue = [f]
+        visited_faces.add(f)
+        while queue:
+            curr = queue.pop(0)
+            comp_faces.append(curr)
+            for edge in curr.edges:
+                for lf in edge.link_faces:
+                    if lf[grid_layer] > 0 and lf not in visited_faces:
+                         visited_faces.add(lf)
+                         queue.append(lf)
+        components.append(comp_faces)
+        
+    # 2. 获取高模空间变换矩阵
+    if ref_obj and topo_obj:
+        matrix_world_ref = ref_obj.matrix_world
+        matrix_inverse_ref = matrix_world_ref.inverted()
+        topo_world = topo_obj.matrix_world
+        topo_inverse = topo_obj.matrix_world.inverted()
+    else:
+        matrix_world_ref = None
+        
+    # 3. 对每个连通分支独立进行优化
+    for comp_faces in components:
+        F = set(comp_faces)
+        V = {v for f in F for v in f.verts}
+        
+        # 找出该分支的边界边：只连接了 F 中一个面的边
+        boundary_edges = {e for e in bm.edges if len([f for f in e.link_faces if f in F]) == 1}
+        boundary_verts = {v for e in boundary_edges for v in e.verts}
+        
+        # 内部顶点和内部共享边界顶点可以自由移动
+        interior_verts = V - boundary_verts
+        if not interior_verts:
+            continue
+            
+        # 计算目标边长 L_target
+        scene = bpy.context.scene
+        L_target = getattr(scene, "tp_edge_length", 0.05)
+        if L_target < 0.001:
+            if boundary_edges:
+                L_target = sum(e.calc_length() for e in boundary_edges) / len(boundary_edges)
+            else:
+                L_target = 0.05
+                
+        if boundary_edges:
+            avg_boundary_len = sum(e.calc_length() for e in boundary_edges) / len(boundary_edges)
+        else:
+            avg_boundary_len = L_target
+            
+        # 预计算每个边界边的向内法线
+        boundary_inwards = {}
+        for e in boundary_edges:
+            mid = (e.verts[0].co + e.verts[1].co) / 2.0
+            connected_f = next(f for f in e.link_faces if f in F)
+            center = connected_f.calc_center_median()
+            inward = (center - mid).normalized()
+            edge_vec = (e.verts[1].co - e.verts[0].co).normalized()
+            inward_proj = (inward - inward.dot(edge_vec) * edge_vec).normalized()
+            boundary_inwards[e] = inward_proj
+            
+        # 4. 迭代优化
+        warmup_iters = int(iterations * 0.3)
+        for step in range(iterations):
+            should_project = (matrix_world_ref is not None) and (step >= warmup_iters)
+            curr_cos = {v: v.co.copy() for v in V}
+            
+            for v in interior_verts:
+                neighbors = []
+                for e in v.link_edges:
+                    if any(f in F for f in e.link_faces):
+                        nb = e.other_vert(v)
+                        neighbors.append((nb, e))
+                        
+                if not neighbors:
+                    continue
+                    
+                # A. 拉普拉斯平滑
+                pos_lap = sum(curr_cos[nb].copy() for nb, _ in neighbors) / len(neighbors)
+                
+                # B. 弹簧力项
+                force_spring = Vector((0.0, 0.0, 0.0))
+                
+                # 直连边弹簧
+                for nb, e in neighbors:
+                    diff = curr_cos[nb] - curr_cos[v]
+                    length = diff.length
+                    if length > 1e-6:
+                        force_spring += (length - L_target) * (diff / length)
+                        
+                # 对角弹簧 (剪切力)
+                L_diag_target = 1.41421356 * L_target
+                for f in v.link_faces:
+                    if f in F and len(f.verts) == 4:
+                        f_verts = list(f.verts)
+                        idx_v = f_verts.index(v)
+                        diag_v = f_verts[(idx_v + 2) % 4]
+                        diff_diag = curr_cos[diag_v] - curr_cos[v]
+                        length_diag = diff_diag.length
+                        if length_diag > 1e-6:
+                            force_spring += 0.5 * (length_diag - L_diag_target) * (diff_diag / length_diag)
+                            
+                pos_spring = curr_cos[v] + 0.25 * force_spring
+                relaxed_pos = curr_cos[v].lerp(pos_lap, smooth_factor).lerp(pos_spring, spring_factor)
+                
+                # C. 贴合高模表面
+                if should_project:
+                    try:
+                        world_pos = topo_world @ curr_cos[v]
+                        local_target_pos = matrix_inverse_ref @ world_pos
+                        success, location, normal, index = ref_obj.closest_point_on_mesh(local_target_pos)
+                        
+                        if success:
+                            normal_world = (matrix_world_ref.to_3x3() @ normal).normalized()
+                            world_relaxed = topo_world @ relaxed_pos
+                            disp = world_relaxed - world_pos
+                            disp_tangent = disp - disp.dot(normal_world) * normal_world
+                            world_relaxed_tangent = world_pos + disp_tangent
+                            
+                            local_target_tangent = matrix_inverse_ref @ world_relaxed_tangent
+                            success_snap, location_snap, normal_snap, index_snap = ref_obj.closest_point_on_mesh(local_target_tangent)
+                            
+                            if success_snap:
+                                local_pt = location_snap + normal_snap * 0.003
+                                projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
+                                if (projected_pos - relaxed_pos).length < 2.0 * avg_boundary_len:
+                                    relaxed_pos = projected_pos
+                    except Exception:
+                        pass
+                        
+                # D. 物理边界碰撞与厚度保护
+                if boundary_edges:
+                    min_dist_sq = float('inf')
+                    best_proj = None
+                    best_inward = None
+                    
+                    for e in boundary_edges:
+                        p_curr = curr_cos[e.verts[0]]
+                        p_next = curr_cos[e.verts[1]]
+                        
+                        AB = p_next - p_curr
+                        ab_len_sq = AB.length_squared
+                        if ab_len_sq < 1e-12:
+                            proj = p_curr.copy()
+                        else:
+                            t_param = (relaxed_pos - p_curr).dot(AB) / ab_len_sq
+                            t_param = max(0.0, min(1.0, t_param))
+                            proj = p_curr + t_param * AB
+                            
+                        dist_sq = (relaxed_pos - proj).length_squared
+                        if dist_sq < min_dist_sq:
+                            min_dist_sq = dist_sq
+                            best_proj = proj
+                            best_inward = boundary_inwards.get(e, Vector((0.0, 0.0, 1.0)))
+                            
+                    margin = 0.15 * avg_boundary_len
+                    V_vec = relaxed_pos - best_proj
+                    dot_val = V_vec.dot(best_inward)
+                    if dot_val < margin:
+                        relaxed_pos = best_proj + best_inward * margin
+                        
+                v.co = relaxed_pos
+
 
 def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor, spring_factor, selected_verts=None, selected_edges=None, user_span=0, user_offset=0):
     """
-    对非线性拼接圈进行多区域栅格填充
+    对非线性拼接圈进行多区域栅格填充，全局协调各子圈的划分参数以达到上下承接效果
     """
     comp_verts = comp['verts']
     comp_edges = comp['edges']
@@ -348,31 +778,21 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
     if not raw_cycles:
         return 0
     cycles = [set(c) for c in raw_cycles]
-        
-    faces_total = 0
-
-    # 2. 为每个环建立填充
+    
+    # 2. 为奇数顶点圈进行边缘细分，确保所有子圈的顶点数均为偶数，以便全局协调划分
     for cycle_idx in range(len(cycles)):
-        bm.verts.index_update()
-        bm.edges.index_update()
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        
         cycle_edges = cycles[cycle_idx]
         loop_verts = trace_cycle_verts(cycle_edges)
         
-        # 检查该圈是否已经被栅格化
         if check_is_grid_filled(bm, loop_verts, cycle_edges):
             continue
             
-        # 如果有选择，仅填充包含选中元素的圈
         if selected_verts or selected_edges:
             has_intersect = any(v in selected_verts for v in loop_verts) or \
                             any(e in selected_edges for e in cycle_edges)
             if not has_intersect:
                 continue
-        
-        # 如果顶点数是奇数，需要细分一个未共享边来凑成偶数
+                
         if len(loop_verts) % 2 != 0:
             edge_counts = {}
             for c in cycles:
@@ -406,36 +826,94 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
                 if new_verts:
                     new_v = new_verts[0]
                     new_edges = list(new_v.link_edges)
-                    # 更新所有包含 best_edge 的环，替换为新生成的两条边
                     for c in cycles:
                         if best_edge in c:
                             c.remove(best_edge)
                             for ne in new_edges:
                                 c.add(ne)
                                 
-                loop_verts = trace_cycle_verts(cycle_edges)
-                
-        L = len(loop_verts)
-        if L < 8:
-            continue
-            
-        best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
-        if not best_params:
-            continue
-            
-        M, N, offset = best_params
+    # 3. 收集所有待填充的 active 圈顶点，并寻找它们之间的共享边界
+    active_indices = []
+    cycles_verts = {}
+    for idx in range(len(cycles)):
+        cycle_edges = cycles[idx]
+        loop_verts = trace_cycle_verts(cycle_edges)
         
-        # Apply user span override if specified (user_span >= 2)
+        if check_is_grid_filled(bm, loop_verts, cycle_edges):
+            continue
+            
+        if selected_verts or selected_edges:
+            has_intersect = any(v in selected_verts for v in loop_verts) or \
+                            any(e in selected_edges for e in cycle_edges)
+            if not has_intersect:
+                continue
+                
+        active_indices.append(idx)
+        cycles_verts[idx] = loop_verts
+        
+    if not active_indices:
+        return 0
+        
+    # 寻找共享边界
+    shared_boundaries = []
+    for i in range(len(active_indices)):
+        for j in range(i + 1, len(active_indices)):
+            idx_a = active_indices[i]
+            idx_b = active_indices[j]
+            V_a = cycles_verts[idx_a]
+            V_b = cycles_verts[idx_b]
+            
+            paths = find_shared_paths(V_a, V_b)
+            for p in paths:
+                shared_boundaries.append({
+                    'cycle_a': idx_a,
+                    'cycle_b': idx_b,
+                    'path': p,
+                    'length': len(p) - 1,
+                    'endpoints': (p[0], p[-1])
+                })
+                
+    # 4. 全局协调求解所有待填充圈的最佳参数
+    # 映射索引到 0..K-1 列表传给 solver
+    active_loops = [cycles_verts[idx] for idx in active_indices]
+    mapped_boundaries = []
+    for sb in shared_boundaries:
+        idx_a_mapped = active_indices.index(sb['cycle_a'])
+        idx_b_mapped = active_indices.index(sb['cycle_b'])
+        mapped_boundaries.append({
+            'cycle_a': idx_a_mapped,
+            'cycle_b': idx_b_mapped,
+            'path': sb['path'],
+            'length': sb['length'],
+            'endpoints': sb['endpoints']
+        })
+        
+    solved_params = solve_global_grid_parameters(active_loops, mapped_boundaries, ref_obj, topo_obj)
+    params_map = {active_indices[k]: solved_params[k] for k in range(len(active_indices))}
+    
+    # 5. 按照协调好的参数为每个圈独立生成初始 Coons 栅格并拓扑生成面
+    faces_total = 0
+    
+    for idx in active_indices:
+        bm.verts.index_update()
+        bm.edges.index_update()
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        
+        cycle_edges = cycles[idx]
+        loop_verts = cycles_verts[idx]
+        L = len(loop_verts)
+        
+        M, N, offset = params_map[idx]
+        
         if user_span >= 2:
             half_L = L // 2
             N = max(2, min(half_L - 2, user_span))
             M = half_L - N
             
-        # Apply user offset override
         offset = (offset + user_offset) % L
         
         grid_coords = init_coons_grid(loop_verts, M, N, offset)
-        
         optimize_grid(
             grid_coords, M, N,
             ref_obj=ref_obj,
@@ -1216,6 +1694,14 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                 joined_filled += 1
                 total_faces += faces_created
                 
+        # 全局整体调优所有拼接的栅格，确保过渡平滑美观
+        global_optimize_spliced_grids(
+            bm, ref_obj, topo_obj,
+            iterations=self.iterations,
+            smooth_factor=self.smooth_factor,
+            spring_factor=self.spring_factor
+        )
+        
         # 重新计算法线方向，确保显示正常（防止非包裹状态下因法线朝向问题显示为黑色）
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
         
@@ -1539,6 +2025,14 @@ def update_last_grid(context):
         # Recalculate normals for new faces
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
         
+    # 全局整体调优所有拼接的栅格，确保过渡平滑美观
+    global_optimize_spliced_grids(
+        bm, ref_obj, topo_obj,
+        iterations=40,
+        smooth_factor=0.4,
+        spring_factor=0.3
+    )
+    
     # === 物理记忆与投影追踪恢复 ===
     bm.verts.ensure_lookup_table()
     
