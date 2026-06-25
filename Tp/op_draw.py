@@ -10,6 +10,58 @@ from bpy_extras.view3d_utils import (
 
 from .draw_utils import draw_callback, draw_text_callback
 
+def is_boundary_edge(e, grid_layer=None):
+    """
+    检查边是否是边界边（连通面数 <= 1，或者其连接的面属于不同的栅格填充区域，即跨区域边界）
+    """
+    if len(e.link_faces) <= 1:
+        return True
+    if not grid_layer:
+        return False
+    # 获取所有连接面的栅格 ID，如果有不同的 ID 则是拼接边界
+    ids = {f[grid_layer] for f in e.link_faces}
+    return len(ids) > 1
+
+def ray_cast_multi(obj, origin_local, direction_local, depsgraph=None):
+    """
+    沿着射线进行迭代投影，获取所有相交点（前表面、后表面、以及深度方向上重叠的各个物体的进出点）。
+    """
+    hits = []
+    curr_origin = origin_local.copy()
+    eps = 0.001
+    max_hits = 20
+    
+    for _ in range(max_hits):
+        try:
+            if depsgraph:
+                success, location, normal, face_idx = obj.ray_cast(
+                    curr_origin,
+                    direction_local,
+                    depsgraph=depsgraph
+                )
+            else:
+                success, location, normal, face_idx = obj.ray_cast(
+                    curr_origin,
+                    direction_local
+                )
+        except Exception:
+            try:
+                success, location, normal, face_idx = obj.ray_cast(
+                    curr_origin,
+                    direction_local
+                )
+            except Exception:
+                success = False
+                
+        if not success:
+            break
+            
+        hits.append((location, normal, face_idx))
+        # 沿着射线方向微调起点以穿透当前面，继续寻找下一个相交面
+        curr_origin = location + direction_local * eps
+        
+    return hits
+
 class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
     bl_idname = "object.tp_topology_draw"
     bl_label = "TP拓扑绘制"
@@ -225,6 +277,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         self.last_clicked_cycles = []
         self.last_clicked_cycle_idx = -1
         self.last_ctrl_state = False
+        self.subdiv_original_loops = None
+        self.subdiv_multiplier = 1.0
         self.start_from_selected_v_co = None
         self.start_from_selected_v_idx = None
         self.max_drag_dist_from_start = 0.0
@@ -318,8 +372,20 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
 
         self.enforce_topology_state(context)
 
+        # Reset the original loops cache if the user performs other actions
+        if event.value == 'PRESS' and event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'MIDDLEMOUSE', 'RET', 'NUMPAD_ENTER', 'ESC', 'G', 'Z', 'Y'}:
+            self.subdiv_original_loops = None
+            self.subdiv_multiplier = 1.0
+        elif event.value == 'RELEASE' and event.type in {'LEFT_CTRL', 'RIGHT_CTRL'}:
+            self.subdiv_original_loops = None
+            self.subdiv_multiplier = 1.0
+
         if getattr(self, 'is_grabbing', False):
             return self.handle_grab_modal(context, event)
+
+        if event.ctrl and event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            if self.handle_loop_subdivision(context, event):
+                return {'RUNNING_MODAL'}
 
         ctrl_pressed = event.ctrl
         if ctrl_pressed and not getattr(self, 'last_ctrl_state', False):
@@ -379,9 +445,12 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     bm.verts.ensure_lookup_table()
                     bm.edges.ensure_lookup_table()
                     
+                    # 获取栅格层信息
+                    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+                    
                     if nearest_v_idx is not None and nearest_v_idx < len(bm.verts):
                         v_target = bm.verts[nearest_v_idx]
-                        cycles = self.find_cycles_through_vertex(v_target)
+                        cycles = self.find_cycles_through_vertex(v_target, grid_layer=grid_layer)
                         
                         if cycles:
                             cycles.sort(key=lambda c: len(c))
@@ -479,7 +548,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                         success_native = False
                                         
                                 if not success_native:
-                                    chain_edges = self.find_edge_chain(nearest_edge)
+                                    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+                                    chain_edges = self.find_edge_chain(nearest_edge, grid_layer=grid_layer)
                                     
                                     if not event.shift:
                                         for v in bm.verts:
@@ -537,7 +607,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                     success_native = False
                                     
                             if not success_native:
-                                chain_edges = self.find_edge_chain(nearest_edge)
+                                grid_layer = bm.faces.layers.int.get("tp_is_grid")
+                                chain_edges = self.find_edge_chain(nearest_edge, grid_layer=grid_layer)
                                 
                                 if not event.shift:
                                     for v in bm.verts:
@@ -1022,6 +1093,65 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
         return None
 
+    def get_back_surface_point(self, context, mouse_coord):
+        ref_obj = bpy.data.objects.get(self.ref_object_name)
+        if not ref_obj:
+            return None
+            
+        region = context.region
+        rv3d = context.space_data.region_3d
+        
+        ray_origin = region_2d_to_origin_3d(region, rv3d, mouse_coord)
+        ray_vector = region_2d_to_vector_3d(region, rv3d, mouse_coord)
+        
+        matrix_world = ref_obj.matrix_world
+        matrix_inverse = matrix_world.inverted()
+        
+        ray_origin_local = matrix_inverse @ ray_origin
+        ray_vector_local = matrix_inverse.to_3x3() @ ray_vector
+        
+        depsgraph = context.evaluated_depsgraph_get()
+        far_dist = max(5.0, ref_obj.dimensions.length * 2.0)
+        
+        try:
+            success_front, loc_front, norm_front, face_front = ref_obj.ray_cast(
+                ray_origin_local,
+                ray_vector_local,
+                depsgraph=depsgraph
+            )
+        except Exception:
+            try:
+                success_front, loc_front, norm_front, face_front = ref_obj.ray_cast(
+                    ray_origin_local,
+                    ray_vector_local
+                )
+            except Exception:
+                success_front = False
+                
+        if success_front:
+            ray_origin_back = loc_front + ray_vector_local * far_dist
+            try:
+                success_back, loc_back, norm_back, face_back = ref_obj.ray_cast(
+                    ray_origin_back,
+                    -ray_vector_local,
+                    depsgraph=depsgraph
+                )
+            except Exception:
+                try:
+                    success_back, loc_back, norm_back, face_back = ref_obj.ray_cast(
+                        ray_origin_back,
+                        -ray_vector_local
+                    )
+                except Exception:
+                    success_back = False
+                    
+            if success_back:
+                local_pt = loc_back + norm_back * 0.003
+                world_pt = matrix_world @ local_pt
+                return world_pt
+                
+        return None
+
     def rebuild_kd_tree(self):
         topo_obj_name = "TP_Topology_Mesh"
         topo_obj = bpy.data.objects.get(topo_obj_name)
@@ -1131,12 +1261,12 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             return nearest_world_pt, nearest_v_idx
         return None, None
 
-    def find_cycles_through_vertex(self, v_start, max_cycles=15, max_len=150):
+    def find_cycles_through_vertex(self, v_start, max_cycles=15, max_len=150, grid_layer=None):
         import collections
         neighbors = []
-        # 获取所有符合边界条件 (link_faces <= 1) 的直连邻居
+        # 获取所有符合边界条件的直连邻居（包括拼接处的共享边界）
         for e in v_start.link_edges:
-            if len(e.link_faces) <= 1:
+            if is_boundary_edge(e, grid_layer):
                 neighbors.append(e.other_vert(v_start))
                 
         cycles = []
@@ -1165,7 +1295,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                         continue
                         
                     for e in curr.link_edges:
-                        if len(e.link_faces) <= 1:
+                        if is_boundary_edge(e, grid_layer):
                             nbr = e.other_vert(curr)
                             if nbr.index not in visited:
                                 visited.add(nbr.index)
@@ -1226,13 +1356,13 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     
         return nearest_edge
 
-    def find_edge_chain(self, edge):
+    def find_edge_chain(self, edge, grid_layer=None):
         chain_edges = {edge}
         
         curr_v = edge.verts[0]
         prev_e = edge
         while True:
-            valid_edges = [e for e in curr_v.link_edges if len(e.link_faces) <= 1]
+            valid_edges = [e for e in curr_v.link_edges if is_boundary_edge(e, grid_layer)]
             if len(valid_edges) != 2:
                 break
             next_e = valid_edges[0] if valid_edges[0] != prev_e else valid_edges[1]
@@ -1245,7 +1375,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         curr_v = edge.verts[1]
         prev_e = edge
         while True:
-            valid_edges = [e for e in curr_v.link_edges if len(e.link_faces) <= 1]
+            valid_edges = [e for e in curr_v.link_edges if is_boundary_edge(e, grid_layer)]
             if len(valid_edges) != 2:
                 break
             next_e = valid_edges[0] if valid_edges[0] != prev_e else valid_edges[1]
@@ -1734,10 +1864,20 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 
             bm.verts.ensure_lookup_table()
             
+            created_edges = []
             for i in range(len(bm_verts) - 1):
                 v1, v2 = bm_verts[i], bm_verts[i+1]
-                if v1 != v2 and not bm.edges.get((v1, v2)):
-                    bm.edges.new((v1, v2))
+                if v1 != v2:
+                    edge = bm.edges.get((v1, v2))
+                    if not edge:
+                        edge = bm.edges.new((v1, v2))
+                    created_edges.append(edge)
+                    
+            if getattr(self, 'is_creating_outside_loop', False):
+                no_auto_layer = bm.edges.layers.int.get("tp_no_auto_fill") or bm.edges.layers.int.new("tp_no_auto_fill")
+                for edge in created_edges:
+                    if edge.is_valid:
+                        edge[no_auto_layer] = 1
                 
             curr_indices = [v.index for v in bm_verts if v is not None]
             bmesh.update_edit_mesh(topo_obj.data)
@@ -1765,10 +1905,20 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 
             bm.verts.ensure_lookup_table()
             
+            created_edges = []
             for i in range(len(bm_verts) - 1):
                 v1, v2 = bm_verts[i], bm_verts[i+1]
-                if v1 != v2 and not bm.edges.get((v1, v2)):
-                    bm.edges.new((v1, v2))
+                if v1 != v2:
+                    edge = bm.edges.get((v1, v2))
+                    if not edge:
+                        edge = bm.edges.new((v1, v2))
+                    created_edges.append(edge)
+                    
+            if getattr(self, 'is_creating_outside_loop', False):
+                no_auto_layer = bm.edges.layers.int.get("tp_no_auto_fill") or bm.edges.layers.int.new("tp_no_auto_fill")
+                for edge in created_edges:
+                    if edge.is_valid:
+                        edge[no_auto_layer] = 1
                 
             curr_indices = [v.index for v in bm_verts if v is not None]
             bm.to_mesh(topo_obj.data)
@@ -1811,7 +1961,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if topo_obj.mode != 'EDIT':
             bm_temp.free()
 
-        if not self.is_polyline and expanded_active_indices:
+        if not self.is_polyline and not getattr(self, 'bypass_resample', False) and expanded_active_indices:
             self.resample_loops(context, topo_obj, active_indices=expanded_active_indices)
             
         if expanded_active_indices:
@@ -1838,6 +1988,75 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 bm.select_history.add(last_v)
             bmesh.update_edit_mesh(topo_obj.data)
 
+            # Check if a closed loop is generated, and if so, perform grid fill immediately
+            from .op_grid_fill import analyze_selection
+            
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            
+            # Save original selection state (which is just the last vertex at this point)
+            orig_sel_verts = [v.index for v in bm.verts if v.select]
+            orig_sel_edges = [e.index for e in bm.edges if e.select]
+            orig_sel_faces = [f.index for f in bm.faces if f.select]
+            
+            # Select all vertices of the newly created stroke to check if they form/part of a closed loop
+            for v in bm.verts:
+                v.select = (v.index in curr_indices)
+            for e in bm.edges:
+                e.select = False
+            for f in bm.faces:
+                f.select = False
+            
+            # Analyze selection to see if it contains a valid unfilled closed loop
+            components, err_msg = analyze_selection(bm, is_auto=True)
+            
+            has_valid_unfilled_loop = False
+            if components and not err_msg:
+                for comp in components:
+                    if comp['type'] in {'loop', 'non_linear_loops'} and not comp.get('is_grid_filled', False):
+                        has_valid_unfilled_loop = True
+                        break
+            
+            if not getattr(self, 'prevent_auto_grid_fill', False) and has_valid_unfilled_loop:
+                # We have a valid unfilled closed loop!
+                # Keep the selection of the new stroke vertices, so the grid fill operator knows what to fill
+                bmesh.update_edit_mesh(topo_obj.data)
+                
+                # Run the grid fill operator
+                try:
+                    bpy.ops.object.tp_topology_grid_fill(is_auto=True)
+                except Exception as e:
+                    print("Auto grid fill error:", e)
+                
+                # After grid fill, restore to only selecting the last vertex of the stroke if it exists and is valid
+                bm = bmesh.from_edit_mesh(topo_obj.data)
+                bm.verts.ensure_lookup_table()
+                for v in bm.verts:
+                    v.select = False
+                for e in bm.edges:
+                    e.select = False
+                for f in bm.faces:
+                    f.select = False
+                
+                if last_idx < len(bm.verts):
+                    last_v = bm.verts[last_idx]
+                    if last_v.is_valid:
+                        last_v.select = True
+                        bm.select_history.clear()
+                        bm.select_history.add(last_v)
+                bmesh.update_edit_mesh(topo_obj.data)
+            else:
+                # No closed loop was formed, restore the selection (the last vertex)
+                for v in bm.verts:
+                    v.select = (v.index in orig_sel_verts)
+                for e in bm.edges:
+                    e.select = (e.index in orig_sel_edges)
+                for f in bm.faces:
+                    f.select = (f.index in orig_sel_faces)
+                bmesh.update_edit_mesh(topo_obj.data)
+
     def create_outside_drag_geometry(self, context, start_2d, end_2d):
         import math
         ref_obj = bpy.data.objects.get(self.ref_object_name)
@@ -1847,29 +2066,23 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         region = context.region
         rv3d = context.space_data.region_3d
         
-        # Calculate screen distance and number of samples
+        # 计算屏幕距离与采样点数
         dx = end_2d[0] - start_2d[0]
         dy = end_2d[1] - start_2d[1]
         dist_px = (dx*dx + dy*dy) ** 0.5
         if dist_px < 8:
             return
             
-        # Sample every 5 pixels, minimum 50 samples for smooth silhouette tracing
         num_samples = max(50, int(dist_px / 5.0))
         
         matrix_world = ref_obj.matrix_world
         matrix_inverse = matrix_world.inverted()
         
-        # Dynamic far distance based on object dimensions to ensure we are well outside the object for the back raycast
-        far_dist = max(5.0, ref_obj.dimensions.length * 2.0)
-        
-        front_pts = [None] * (num_samples + 1)
-        back_pts = [None] * (num_samples + 1)
-        hits = [False] * (num_samples + 1)
+        # 1. 离散采样并进行多重投射，收集所有前/后表面及重叠物体的进出段 (Intervals)
+        all_intervals = [[] for _ in range(num_samples + 1)]
         
         start_vec = mathutils.Vector(start_2d)
         end_vec = mathutils.Vector(end_2d)
-        
         depsgraph = context.evaluated_depsgraph_get()
         
         for i in range(num_samples + 1):
@@ -1882,135 +2095,201 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             ray_origin_local = matrix_inverse @ ray_origin
             ray_vector_local = matrix_inverse.to_3x3() @ ray_vector
             
-            # Cast from front
-            try:
-                success_front, loc_front, norm_front, face_front = ref_obj.ray_cast(
-                    ray_origin_local,
-                    ray_vector_local,
-                    depsgraph=depsgraph
-                )
-            except Exception:
-                try:
-                    success_front, loc_front, norm_front, face_front = ref_obj.ray_cast(
-                        ray_origin_local,
-                        ray_vector_local
-                    )
-                except Exception:
-                    success_front = False
+            # 使用多重穿透投影获取该射线下的所有碰撞点
+            hits_local = ray_cast_multi(ref_obj, ray_origin_local, ray_vector_local, depsgraph)
             
-            if success_front:
-                # Cast from back, starting from the front intersection point plus far_dist along the ray
-                ray_origin_back = loc_front + ray_vector_local * far_dist
-                try:
-                    success_back, loc_back, norm_back, face_back = ref_obj.ray_cast(
-                        ray_origin_back,
-                        -ray_vector_local,
-                        depsgraph=depsgraph
-                    )
-                except Exception:
-                    try:
-                        success_back, loc_back, norm_back, face_back = ref_obj.ray_cast(
-                            ray_origin_back,
-                            -ray_vector_local
-                        )
-                    except Exception:
-                        success_back = False
-                        
-                if success_back:
-                    local_pt_front = loc_front + norm_front * 0.003
-                    world_pt_front = matrix_world @ local_pt_front
-                    
-                    local_pt_back = loc_back + norm_back * 0.003
-                    world_pt_back = matrix_world @ local_pt_back
-                    
-                    front_pts[i] = world_pt_front
-                    back_pts[i] = world_pt_back
-                    hits[i] = True
-                    
-        # Find continuous segments of hits
-        segments = []
-        in_segment = False
-        seg_start = -1
+            # 两两成对：每个奇数段（入点/前表面）与偶数段（出点/后表面）代表一个实心几何体厚度区间
+            num_pairs = len(hits_local) // 2
+            for k in range(num_pairs):
+                loc_front, norm_front, _ = hits_local[2*k]
+                loc_back, norm_back, _ = hits_local[2*k + 1]
+                
+                local_pt_front = loc_front + norm_front * 0.003
+                world_pt_front = matrix_world @ local_pt_front
+                
+                local_pt_back = loc_back + norm_back * 0.003
+                world_pt_back = matrix_world @ local_pt_back
+                
+                # 计算相机空间深度（沿着视线方向的投影距离）
+                depth = (world_pt_front - ray_origin).dot(ray_vector)
+                
+                all_intervals[i].append({
+                    'front': world_pt_front,
+                    'back': world_pt_back,
+                    'depth': depth
+                })
+                
+        # 2. 轨迹关联追踪 (Track Association)：区分深度方向上重叠的各个物体（例如并排重叠的圆锥）
+        active_tracks = []
+        finished_tracks = []
+        
+        edge_len = context.scene.tp_edge_length
+        # 关联阈值：如果相邻采样点的 3D 距离在此范围内，视为同一个物体
+        assoc_threshold = edge_len * 3.0
         
         for i in range(num_samples + 1):
-            if hits[i]:
-                if not in_segment:
-                    in_segment = True
-                    seg_start = i
-            else:
-                if in_segment:
-                    in_segment = False
-                    segments.append((seg_start, i - 1))
-        if in_segment:
-            segments.append((seg_start, num_samples))
+            intervals = all_intervals[i]
+            matched_intervals = set()
+            matched_tracks = set()
+            matches = []
             
-        # Helper function for path resampling
-        def resample_path(points, target_edge_len):
-            n_pts = len(points)
-            if n_pts < 2:
-                return points
-            path_dists = [0.0]
-            for idx_p in range(n_pts - 1):
-                path_dists.append(path_dists[-1] + (points[idx_p+1] - points[idx_p]).length)
-            total_path_len = path_dists[-1]
-            if total_path_len < 0.001:
-                return [points[0]]
-            n_segs = max(1, round(total_path_len / target_edge_len))
-            resampled_pts = []
-            for idx_s in range(n_segs + 1):
-                t_d = (idx_s / n_segs) * total_path_len
-                found_idx = 1
-                for idx_k in range(1, len(path_dists)):
-                    if path_dists[idx_k] >= t_d:
-                        found_idx = idx_k
-                        break
-                d_s = path_dists[found_idx-1]
-                d_e = path_dists[found_idx]
-                s_len = d_e - d_s
-                f_factor = (t_d - d_s) / s_len if s_len > 0.0 else 0.0
-                p_new = points[found_idx-1].lerp(points[found_idx], f_factor)
-                resampled_pts.append(p_new)
-            return resampled_pts
+            # 对所有仍在活动的轨迹，计算其末端点到当前各个区间的距离
+            for t_idx, track in enumerate(active_tracks):
+                if track['indices'][-1] == i - 1:
+                    last_front = track['front_pts'][-1]
+                    for val_idx, interval in enumerate(intervals):
+                        dist = (interval['front'] - last_front).length
+                        if dist < assoc_threshold:
+                            matches.append((dist, t_idx, val_idx))
+                            
+            # 优先匹配距离最近 of 区间
+            matches.sort(key=lambda x: x[0])
+            for dist, t_idx, val_idx in matches:
+                if t_idx not in matched_tracks and val_idx not in matched_intervals:
+                    matched_tracks.add(t_idx)
+                    matched_intervals.add(val_idx)
+                    track = active_tracks[t_idx]
+                    track['indices'].append(i)
+                    track['front_pts'].append(intervals[val_idx]['front'])
+                    track['back_pts'].append(intervals[val_idx]['back'])
+                    track['depths'].append(intervals[val_idx]['depth'])
+                    
+            # 未被匹配的当前区间，作为新轨迹启动（解决新物体探出）
+            for val_idx, interval in enumerate(intervals):
+                if val_idx not in matched_intervals:
+                    active_tracks.append({
+                        'indices': [i],
+                        'front_pts': [interval['front']],
+                        'back_pts': [interval['back']],
+                        'depths': [interval['depth']]
+                    })
             
-        # For each segment, construct a closed loop and create geometry
-        geom_created = False
-        for seg_start_idx, seg_end_idx in segments:
-            # We want at least a few points to make a valid loop
-            if seg_end_idx - seg_start_idx < 2:
+            # 整理活动轨迹：若某轨迹在此步没有匹配，则已结束
+            new_active_tracks = []
+            for track in active_tracks:
+                if track['indices'][-1] == i:
+                    new_active_tracks.append(track)
+                else:
+                    if len(track['indices']) >= 2:
+                        finished_tracks.append(track)
+            active_tracks = new_active_tracks
+            
+        for track in active_tracks:
+            if len(track['indices']) >= 2:
+                finished_tracks.append(track)
+                
+        # 3. 对每条独立轨迹，在沿表面方向进行突变深谷（Prominence-based Valley）二次切分
+        final_tracks = []
+        prominence_threshold = edge_len * 2.0
+        
+        for track in finished_tracks:
+            front_pts_track = track['front_pts']
+            back_pts_track = track['back_pts']
+            depths_track = track['depths']
+            indices_track = track['indices']
+            
+            n_pts = len(front_pts_track)
+            if n_pts < 5:
+                final_tracks.append(track)
                 continue
                 
-            seg_front = front_pts[seg_start_idx : seg_end_idx + 1]
-            seg_back = back_pts[seg_start_idx : seg_end_idx + 1]
-            
-            edge_len = context.scene.tp_edge_length
-            if edge_len < 0.001:
-                edge_len = 0.001
+            # 五邻域滑动均值平滑，消除表面凹凸噪声
+            smoothed_depths = list(depths_track)
+            for i in range(2, n_pts - 2):
+                smoothed_depths[i] = sum(depths_track[i+k] for k in range(-2, 3)) / 5.0
                 
-            # Resample front and back paths independently along the surface
-            resampled_front = resample_path(seg_front, edge_len)
-            resampled_back = resample_path(seg_back, edge_len)
+            split_indices = []
+            for i in range(2, n_pts - 2):
+                # 寻找局部最大深度点（离相机最远的谷底）
+                if smoothed_depths[i] > smoothed_depths[i-1] and smoothed_depths[i] > smoothed_depths[i+1]:
+                    left_min = min(smoothed_depths[0 : i])
+                    right_min = min(smoothed_depths[i+1 : n_pts])
+                    
+                    prominence_left = smoothed_depths[i] - left_min
+                    prominence_right = smoothed_depths[i] - right_min
+                    
+                    # 只有突出度（高度差）超过阈值时才进行物理断开
+                    if prominence_left > prominence_threshold and prominence_right > prominence_threshold:
+                        split_indices.append(i)
+                        
+            # 对轨迹进行断开并生成子轨迹
+            curr_start = 0
+            for split_idx in sorted(split_indices):
+                if split_idx - curr_start >= 2:
+                    final_tracks.append({
+                        'indices': indices_track[curr_start : split_idx],
+                        'front_pts': front_pts_track[curr_start : split_idx],
+                        'back_pts': back_pts_track[curr_start : split_idx],
+                        'depths': depths_track[curr_start : split_idx]
+                    })
+                curr_start = split_idx + 1
+            if n_pts - curr_start >= 2:
+                final_tracks.append({
+                    'indices': indices_track[curr_start : n_pts],
+                    'front_pts': front_pts_track[curr_start : n_pts],
+                    'back_pts': back_pts_track[curr_start : n_pts],
+                    'depths': depths_track[curr_start : n_pts]
+                })
+                
+        # 4. 针对最终的所有独立分块，分别生成闭合线圈并创建几何体
+        geom_created = False
+        for track in final_tracks:
+            seg_front = track['front_pts']
+            seg_back = track['back_pts']
             
-            # Resample the transition paths (silhouette edges) as well
-            transition_end = resample_path([resampled_front[-1], resampled_back[-1]], edge_len)
-            transition_start = resample_path([resampled_back[0], resampled_front[0]], edge_len)
+            # 首尾相连组成闭合曲线：前表面路径 + 反转后的后表面路径 + 回到起点
+            loop_points = list(seg_front) + list(reversed(seg_back)) + [seg_front[0]]
             
-            # Construct closed loop: front path -> transition end -> reversed back path -> transition start -> close
-            loop_points = []
-            loop_points.extend(resampled_front)
-            if len(transition_end) > 2:
-                loop_points.extend(transition_end[1:-1])
-            loop_points.extend(reversed(resampled_back))
-            if len(transition_start) > 2:
-                loop_points.extend(transition_start[1:-1])
-            loop_points.append(resampled_front[0])  # Close the loop
+            dists = [0.0]
+            for idx in range(len(loop_points) - 1):
+                dists.append(dists[-1] + (loop_points[idx+1] - loop_points[idx]).length)
+            total_perimeter = dists[-1]
             
+            if total_perimeter > 0.001:
+                n_initial = max(3, round(total_perimeter / edge_len))
+                E_target = max(4, int((n_initial + 2) / 4) * 4)
+                
+                final_loop_points = []
+                for j in range(E_target):
+                    target_d = (j / E_target) * total_perimeter
+                    idx_d = 1
+                    for idx_k in range(1, len(dists)):
+                        if dists[idx_k] >= target_d:
+                            idx_d = idx_k
+                            break
+                    d_start = dists[idx_d-1]
+                    d_end = dists[idx_d]
+                    seg_len = d_end - d_start
+                    factor = (target_d - d_start) / seg_len if seg_len > 0.0 else 0.0
+                    p_new = loop_points[idx_d-1].lerp(loop_points[idx_d], factor)
+                    
+                    if ref_obj:
+                        try:
+                            local_target = matrix_inverse @ p_new
+                            success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
+                            if success:
+                                local_pt = location + normal * 0.003
+                                p_new = matrix_world @ local_pt
+                        except Exception:
+                            pass
+                    final_loop_points.append(p_new)
+                final_loop_points.append(final_loop_points[0])
+                loop_points = final_loop_points
+                
             self.stroke_points = loop_points
             self.stroke_snap_indices = [None] * len(loop_points)
-            self.is_polyline = False  # Ensured to trigger smoothing and conforming
-            self.bypass_resample = True  # Avoid double-resampling and clustering
+            self.is_polyline = False
+            self.bypass_resample = True
             
-            self.create_geometry(context)
-            self.bypass_resample = False  # Reset flag
+            self.prevent_auto_grid_fill = True
+            self.is_creating_outside_loop = True
+            try:
+                self.create_geometry(context)
+            finally:
+                self.prevent_auto_grid_fill = False
+                self.is_creating_outside_loop = False
+                
+            self.bypass_resample = False
             geom_created = True
             
         if geom_created:
@@ -2091,8 +2370,6 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         # 还原用户的吸附设置
         try:
             context.scene.tool_settings.use_snap = self.orig_use_snap
-            context.scene.tool_settings.snap_elements = self.orig_snap_elements
-            context.scene.tool_settings.snap_target = self.orig_snap_target
             if hasattr(self, 'orig_use_snap_project') and hasattr(context.scene.tool_settings, 'use_snap_project'):
                 context.scene.tool_settings.use_snap_project = self.orig_use_snap_project
             if hasattr(self, 'orig_use_snap_selectable') and hasattr(context.scene.tool_settings, "use_snap_selectable"):
@@ -2144,6 +2421,580 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             context.workspace.status_text_set(None)
         except Exception:
             pass
+
+    def trace_boundary_loop_from_edges(self, bm, E_boundary):
+        if not E_boundary:
+            return []
+        adj = {}
+        for e in E_boundary:
+            for v in e.verts:
+                adj.setdefault(v, []).append(e)
+                
+        start_v = None
+        for v, edges in adj.items():
+            if len(edges) == 2:
+                start_v = v
+                break
+        if not start_v:
+            return []
+            
+        loop_verts = []
+        curr_v = start_v
+        prev_edge = None
+        visited = set()
+        
+        while curr_v and curr_v not in visited:
+            loop_verts.append(curr_v)
+            visited.add(curr_v)
+            next_v = None
+            for e in adj[curr_v]:
+                if e != prev_edge:
+                    next_v = e.other_vert(curr_v)
+                    prev_edge = e
+                    break
+            if next_v == start_v:
+                break
+            curr_v = next_v
+        return loop_verts
+
+    def find_all_loops(self, bm):
+        loops = []
+        grid_layer = bm.faces.layers.int.get("tp_is_grid")
+        
+        # 1. Find all rasterized loops
+        if grid_layer:
+            loop_ids = set()
+            for f in bm.faces:
+                if f[grid_layer] > 0:
+                    loop_ids.add(f[grid_layer])
+                    
+            for lid in sorted(loop_ids):
+                F_loop = [f for f in bm.faces if f[grid_layer] == lid]
+                if not F_loop:
+                    continue
+                F_loop_set = set(F_loop)
+                E_loop_all = set()
+                for f in F_loop:
+                    E_loop_all.update(f.edges)
+                    
+                E_boundary = {e for e in E_loop_all if len([f for f in e.link_faces if f[grid_layer] == lid]) == 1}
+                ordered_verts = self.trace_boundary_loop_from_edges(bm, E_boundary)
+                if ordered_verts:
+                    loops.append({
+                        'type': 'rasterized',
+                        'loop_id': lid,
+                        'verts': ordered_verts,
+                        'faces': F_loop
+                    })
+                    
+        # 2. Find all unrasterized loops (wire loops) and open paths (line segments)
+        wire_edges = [e for e in bm.edges if len(e.link_faces) == 0]
+        if wire_edges:
+            adj = {}
+            for e in wire_edges:
+                for v in e.verts:
+                    adj.setdefault(v, []).append(e)
+                    
+            visited = set()
+            for v in list(adj.keys()):
+                if v in visited:
+                    continue
+                    
+                comp_verts = []
+                comp_edges = set()
+                queue = [v]
+                visited.add(v)
+                
+                while queue:
+                    curr = queue.pop(0)
+                    comp_verts.append(curr)
+                    
+                    for e in adj[curr]:
+                        comp_edges.add(e)
+                        v2 = e.other_vert(curr)
+                        if v2 not in visited:
+                            visited.add(v2)
+                            queue.append(v2)
+                
+                # Analyze degrees of vertices in the component
+                degrees = {cv: len(adj[cv]) for cv in comp_verts}
+                max_degree = max(degrees.values()) if degrees else 0
+                
+                # Check if it's a simple closed loop
+                is_simple_loop = all(d == 2 for d in degrees.values())
+                
+                if is_simple_loop and len(comp_verts) >= 3:
+                    ordered_verts = self.trace_boundary_loop_from_edges(bm, comp_edges)
+                    if ordered_verts:
+                        loops.append({
+                            'type': 'unrasterized',
+                            'verts': ordered_verts
+                        })
+                elif max_degree <= 2:
+                    # Check if it's a simple open path (line segment)
+                    deg1_verts = [cv for cv, d in degrees.items() if d == 1]
+                    if len(deg1_verts) == 2:
+                        start_v = deg1_verts[0]
+                        ordered_verts = []
+                        curr_v = start_v
+                        prev_edge = None
+                        path_visited = set()
+                        
+                        while curr_v and curr_v not in path_visited:
+                            ordered_verts.append(curr_v)
+                            path_visited.add(curr_v)
+                            
+                            next_edge = None
+                            for e in adj[curr_v]:
+                                if e != prev_edge and e in comp_edges:
+                                    next_edge = e
+                                    break
+                            if not next_edge:
+                                break
+                            prev_edge = next_edge
+                            curr_v = next_edge.other_vert(curr_v)
+                            
+                        if len(ordered_verts) >= 2:
+                            loops.append({
+                                'type': 'open_path',
+                                'verts': ordered_verts
+                            })
+                            
+        return loops
+
+    def handle_loop_subdivision(self, context, event):
+        topo_obj_name = "TP_Topology_Mesh"
+        topo_obj = bpy.data.objects.get(topo_obj_name)
+        if not topo_obj or topo_obj.mode != 'EDIT':
+            return False
+            
+        bm = bmesh.from_edit_mesh(topo_obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        
+        # 1. Initialize the original loops cache if this is the start of a scroll sequence
+        if getattr(self, 'subdiv_original_loops', None) is None:
+            loops = self.find_all_loops(bm)
+            if not loops:
+                self.report({'INFO'}, "未检测到任何已绘制的栅格、圈或线段，无法细分")
+                return True
+                
+            # Count occurrences of each vertex across all loops to find splicing points
+            vert_loop_count = {}
+            for loop in loops:
+                for v in loop['verts']:
+                    vert_loop_count[v] = vert_loop_count.get(v, 0) + 1
+            
+            self.subdiv_original_loops = []
+            for loop in loops:
+                splicing_indices = set()
+                for idx, v in enumerate(loop['verts']):
+                    if vert_loop_count[v] > 1:
+                        splicing_indices.add(idx)
+                        
+                self.subdiv_original_loops.append({
+                    'type': loop['type'],
+                    'coords': [v.co.copy() for v in loop['verts']],
+                    'splicing_indices': splicing_indices,
+                    'original_count': len(loop['verts']),
+                    'loop_id': loop.get('loop_id', None)
+                })
+            self.subdiv_multiplier = 1.0
+            
+        # 2. Update the subdivision multiplier
+        if event.type == 'WHEELUPMOUSE':
+            self.subdiv_multiplier += 0.1
+        else:
+            # Check if any loop can still be unsubdivided (i.e. has more edges than its minimum limit)
+            can_unsubdivide = False
+            for orig_loop in self.subdiv_original_loops:
+                orig_count = orig_loop['original_count']
+                splicing_indices = orig_loop.get('splicing_indices', set())
+                is_open = (orig_loop['type'] == 'open_path')
+                orig_edges = (orig_count - 1) if is_open else orig_count
+                
+                current_edges = orig_edges * self.subdiv_multiplier
+                if orig_loop['type'] == 'rasterized':
+                    current_edges = round(current_edges / 2) * 2
+                else:
+                    current_edges = round(current_edges)
+                    
+                if orig_loop['type'] == 'open_path':
+                    S_len = len(splicing_indices | {0, orig_count - 1})
+                    num_segs = S_len - 1
+                    min_allowed = max(2, num_segs + 1)
+                else:
+                    num_segs = len(splicing_indices) if splicing_indices else 1
+                    base_min = 8 if orig_loop['type'] == 'rasterized' else 4
+                    min_allowed = max(base_min, num_segs)
+                    
+                min_allowed_edges = (min_allowed - 1) if is_open else min_allowed
+                
+                if current_edges > min_allowed_edges:
+                    can_unsubdivide = True
+                    break
+                    
+            if not can_unsubdivide:
+                self.report({'INFO'}, "已达到最小细分限制，无法继续反细分")
+                return True
+                
+            self.subdiv_multiplier -= 0.1
+            if self.subdiv_multiplier < 0.1:
+                self.subdiv_multiplier = 0.1
+            
+        # Backup the BMesh in case recreation or grid-fill fails
+        bm_backup = bm.copy()
+            
+        # 3. Calculate new counts and verify if any loop is valid
+        loop_updates = []
+        for orig_loop in self.subdiv_original_loops:
+            orig_count = orig_loop['original_count']
+            splicing_indices = orig_loop.get('splicing_indices', set())
+            
+            if orig_loop['type'] == 'open_path':
+                S_len = len(splicing_indices | {0, orig_count - 1})
+                num_segs = S_len - 1
+                min_allowed = max(2, num_segs + 1)
+            else:
+                num_segs = len(splicing_indices) if splicing_indices else 1
+                base_min = 8 if orig_loop['type'] == 'rasterized' else 4
+                min_allowed = max(base_min, num_segs)
+                
+            is_open = (orig_loop['type'] == 'open_path')
+            orig_edges = (orig_count - 1) if is_open else orig_count
+            new_edges = orig_edges * self.subdiv_multiplier
+            
+            if orig_loop['type'] == 'rasterized':
+                new_edges = round(new_edges / 2) * 2
+            else:
+                new_edges = round(new_edges)
+                
+            min_allowed_edges = (min_allowed - 1) if is_open else min_allowed
+            if new_edges < min_allowed_edges:
+                new_edges = min_allowed_edges
+                
+            new_count = (new_edges + 1) if is_open else new_edges
+                
+            loop_updates.append({
+                'orig_loop': orig_loop,
+                'new_count': new_count
+            })
+            
+        # Find all current loops in the BMesh to delete them
+        current_loops = self.find_all_loops(bm)
+        if not current_loops:
+            self.subdiv_original_loops = None
+            bm_backup.free()
+            return True
+            
+        def get_segment_coords(coords, start_idx, end_idx):
+            N = len(coords)
+            seg_coords = []
+            for idx in range(start_idx, end_idx + 1):
+                actual_idx = idx % N
+                seg_coords.append(coords[actual_idx].copy())
+            return seg_coords
+
+        # 4. Generate resampled coordinates from the ORIGINAL loop coordinates
+        for update in loop_updates:
+            orig_loop = update['orig_loop']
+            new_count = update['new_count']
+            
+            P = orig_loop['coords']
+            N = len(P)
+            splicing_indices = orig_loop.get('splicing_indices', set())
+            is_open = (orig_loop['type'] == 'open_path')
+            
+            if is_open:
+                S = sorted(list(splicing_indices | {0, N - 1}))
+            else:
+                if not splicing_indices:
+                    S = [0, N]
+                else:
+                    sorted_splits = sorted(list(splicing_indices))
+                    S = sorted_splits + [sorted_splits[0] + N]
+            
+            segments = []
+            total_len = 0.0
+            for i in range(len(S) - 1):
+                start_idx = S[i]
+                end_idx = S[i+1]
+                seg_coords = get_segment_coords(P, start_idx, end_idx)
+                
+                dists = [0.0]
+                for j in range(len(seg_coords) - 1):
+                    dists.append(dists[-1] + (seg_coords[j+1] - seg_coords[j]).length)
+                seg_len = dists[-1]
+                
+                segments.append({
+                    'coords': seg_coords,
+                    'dists': dists,
+                    'length': seg_len
+                })
+                total_len += seg_len
+                
+            target_edges = (new_count - 1) if is_open else new_count
+            num_segs = len(segments)
+            
+            if total_len > 1e-5:
+                raw_edges = [target_edges * (seg['length'] / total_len) for seg in segments]
+                edges = [max(1, round(re)) for re in raw_edges]
+            else:
+                edges = [max(1, target_edges // num_segs)] * num_segs
+                
+            diff = target_edges - sum(edges)
+            while diff != 0:
+                if diff > 0:
+                    best_idx = -1
+                    best_val = -1e9
+                    for idx in range(num_segs):
+                        val = (raw_edges[idx] - edges[idx]) if total_len > 1e-5 else 0
+                        if val > best_val:
+                            best_val = val
+                            best_idx = idx
+                    edges[best_idx] += 1
+                    diff -= 1
+                else:
+                    best_idx = -1
+                    best_val = -1e9
+                    for idx in range(num_segs):
+                        if edges[idx] > 1:
+                            val = (edges[idx] - raw_edges[idx]) if total_len > 1e-5 else 0
+                            if val > best_val:
+                                best_val = val
+                                best_idx = idx
+                    if best_idx == -1:
+                        break
+                    edges[best_idx] -= 1
+                    diff += 1
+                    
+            resampled_segments = []
+            for i, seg in enumerate(segments):
+                seg_coords = seg['coords']
+                seg_dists = seg['dists']
+                seg_len = seg['length']
+                seg_edges = edges[i]
+                
+                new_seg_coords = []
+                for j in range(seg_edges + 1):
+                    target_d = (j / seg_edges) * seg_len if seg_edges > 0 and seg_len > 0.0 else 0.0
+                    idx = 0
+                    while idx < len(seg_dists) - 1 and seg_dists[idx+1] < target_d:
+                        idx += 1
+                    d0 = seg_dists[idx]
+                    d1 = seg_dists[idx+1]
+                    s_len = d1 - d0
+                    if s_len > 1e-5:
+                        factor = (target_d - d0) / s_len
+                    else:
+                        factor = 0.0
+                    p_new = seg_coords[idx] + factor * (seg_coords[idx+1] - seg_coords[idx])
+                    new_seg_coords.append(p_new)
+                resampled_segments.append(new_seg_coords)
+                
+            new_coords = []
+            for i, seg_resampled in enumerate(resampled_segments):
+                if i == 0:
+                    new_coords.extend(seg_resampled)
+                else:
+                    new_coords.extend(seg_resampled[1:])
+            if not is_open and len(new_coords) > 1:
+                new_coords.pop()
+                
+            update['new_coords'] = new_coords
+            
+        # 5. Delete all current loops in the BMesh
+        bm.select_history.clear()
+        verts_to_delete = set()
+        for loop in current_loops:
+            if loop['type'] == 'rasterized':
+                for f in loop['faces']:
+                    if f.is_valid:
+                        verts_to_delete.update(f.verts)
+            else:
+                for v in loop['verts']:
+                    if v.is_valid:
+                        verts_to_delete.add(v)
+                        
+        bmesh.ops.delete(bm, geom=list(verts_to_delete), context='VERTS')
+        
+        # 6. Recreate the loops with their resampled coordinates
+        created_loops = []
+        for update in loop_updates:
+            coords = update['new_coords']
+            orig_loop = update['orig_loop']
+            
+            new_verts = []
+            for co in coords:
+                v = bm.verts.new(co)
+                new_verts.append(v)
+            bm.verts.ensure_lookup_table()
+            
+            new_edges = []
+            if orig_loop['type'] == 'open_path':
+                for i in range(len(new_verts) - 1):
+                    v1 = new_verts[i]
+                    v2 = new_verts[i + 1]
+                    e = bm.edges.new((v1, v2))
+                    new_edges.append(e)
+            else:
+                for i in range(len(new_verts)):
+                    v1 = new_verts[i]
+                    v2 = new_verts[(i + 1) % len(new_verts)]
+                    e = bm.edges.new((v1, v2))
+                    new_edges.append(e)
+            bm.edges.ensure_lookup_table()
+            
+            vert_indices = [v.index for v in new_verts]
+            created_loops.append({
+                'type': orig_loop['type'],
+                'vert_indices': vert_indices,
+                'loop_id': orig_loop.get('loop_id', None)
+            })
+            
+        for v in bm.verts:
+            v.select = False
+        for e in bm.edges:
+            e.select = False
+        for f in bm.faces:
+            f.select = False
+            
+        bmesh.update_edit_mesh(topo_obj.data)
+        self.rebuild_kd_tree()
+        
+        try:
+            bpy.ops.ed.undo_push(message="TP 全局循环圈细分")
+        except Exception as e:
+            print("Error pushing undo step during global subdivision:", e)
+            
+        # 7. Grid-fill each rasterized loop one by one
+        grid_fill_success = True
+        for loop_info in created_loops:
+            if loop_info['type'] == 'rasterized':
+                bm = bmesh.from_edit_mesh(topo_obj.data)
+                bm.verts.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
+                
+                for v in bm.verts:
+                    v.select = False
+                for e in bm.edges:
+                    e.select = False
+                for f in bm.faces:
+                    f.select = False
+                    
+                vert_indices = loop_info['vert_indices']
+                bm_verts_to_select = []
+                for idx in vert_indices:
+                    if idx < len(bm.verts):
+                        bm_verts_to_select.append(bm.verts[idx])
+                
+                for v in bm_verts_to_select:
+                    v.select = True
+                
+                vert_set = set(bm_verts_to_select)
+                for e in bm.edges:
+                    if e.verts[0] in vert_set and e.verts[1] in vert_set:
+                        e.select = True
+                        
+                bmesh.update_edit_mesh(topo_obj.data)
+                
+                try:
+                    res = bpy.ops.object.tp_topology_grid_fill()
+                    if 'FINISHED' not in res:
+                        grid_fill_success = False
+                        break
+                    
+                    # Double-check that faces were actually created for this loop
+                    bm_check = bmesh.from_edit_mesh(topo_obj.data)
+                    bm_check.verts.ensure_lookup_table()
+                    has_faces = False
+                    for idx in vert_indices:
+                        if idx < len(bm_check.verts):
+                            if len(bm_check.verts[idx].link_faces) > 0:
+                                has_faces = True
+                                break
+                    if not has_faces:
+                        grid_fill_success = False
+                        break
+                except Exception as e:
+                    print("Error running grid fill during global subdivision:", e)
+                    grid_fill_success = False
+                    break
+                    
+        if not grid_fill_success:
+            # Restore BMesh from backup
+            bm_backup.to_mesh(topo_obj.data)
+            bmesh.update_edit_mesh(topo_obj.data)
+            bm_backup.free()
+            
+            # Revert the multiplier
+            if event.type == 'WHEELUPMOUSE':
+                self.subdiv_multiplier -= 0.1
+            else:
+                self.subdiv_multiplier += 0.1
+                
+            self.rebuild_kd_tree()
+            self.report({'INFO'}, "由于网格填充失败，已自动撤销该细分级别")
+            context.area.tag_redraw()
+            return True
+            
+        # Free the backup BMesh since everything succeeded
+        bm_backup.free()
+                    
+        # 8. Select all boundary vertices of all created loops and weld them
+        bm = bmesh.from_edit_mesh(topo_obj.data)
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
+        bm.verts.ensure_lookup_table()
+        
+        for v in bm.verts:
+            v.select = False
+        for e in bm.edges:
+            e.select = False
+        for f in bm.faces:
+            f.select = False
+            
+        for loop_info in created_loops:
+            vert_indices = loop_info['vert_indices']
+            for idx in vert_indices:
+                if idx < len(bm.verts):
+                    bm.verts[idx].select = True
+                    
+        bmesh.update_edit_mesh(topo_obj.data)
+        self.rebuild_kd_tree()
+        
+        # 9. Update the edge length parameter in the scene / N-panel
+        total_loop_edge_lens = []
+        for update in loop_updates:
+            new_count = update['new_count']
+            P = update['new_coords']
+            perimeter = 0.0
+            is_open = (update['orig_loop']['type'] == 'open_path')
+            
+            for i in range(len(P)):
+                p1 = P[i]
+                if is_open:
+                    if i == len(P) - 1:
+                        continue
+                    p2 = P[i + 1]
+                else:
+                    p2 = P[(i + 1) % len(P)]
+                perimeter += (p2 - p1).length
+                
+            if new_count > 0:
+                edge_count = (new_count - 1) if is_open else new_count
+                if edge_count > 0:
+                    total_loop_edge_lens.append(perimeter / edge_count)
+                
+        if total_loop_edge_lens:
+            avg_edge_len = sum(total_loop_edge_lens) / len(total_loop_edge_lens)
+            context.scene.tp_edge_length = avg_edge_len
+            
+        action = "细分" if event.type == 'WHEELUPMOUSE' else "反细分"
+        self.report({'INFO'}, f"已对所有栅格、线段和圈进行全局{action}，当前密度比例：{self.subdiv_multiplier:.2f}")
+        context.area.tag_redraw()
+        return True
 
     def check_line_crosses_ref_mesh(self, ref_obj, pt1_world, pt2_world):
         matrix_inverse = ref_obj.matrix_world.inverted()

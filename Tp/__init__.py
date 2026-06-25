@@ -74,6 +74,19 @@ def register():
         default=False,
         update=op_draw.on_pin_boundary_update
     )
+    bpy.types.Scene.tp_grid_span = bpy.props.IntProperty(
+        name="跨分",
+        description="栅格一边的网格数。0 表示自动计算",
+        default=0,
+        min=0,
+        update=op_grid_fill.on_grid_settings_update
+    )
+    bpy.types.Scene.tp_grid_offset = bpy.props.IntProperty(
+        name="偏移",
+        description="网格顶点的起点偏移量",
+        default=0,
+        update=op_grid_fill.on_grid_settings_update
+    )
     
     # Register depsgraph update handler
     bpy.app.handlers.depsgraph_update_post.append(op_draw.tp_pin_depsgraph_handler)
@@ -87,6 +100,8 @@ def unregister():
     del bpy.types.Scene.tp_smooth_factor
     del bpy.types.Scene.tp_use_wrap
     del bpy.types.Scene.tp_pin_boundary
+    del bpy.types.Scene.tp_grid_span
+    del bpy.types.Scene.tp_grid_offset
     
     # Unregister depsgraph update handler
     if op_draw.tp_pin_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:

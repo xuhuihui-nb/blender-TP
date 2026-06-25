@@ -26,7 +26,7 @@ def check_is_grid_filled(bm, loop_verts, cycle_edges):
     return ratio > 0.8
 
 
-def analyze_selection(bm):
+def analyze_selection(bm, is_auto=False):
     """
     分析选中的或所有的外圈（边界连通分支）。
     返回：
@@ -197,6 +197,24 @@ def analyze_selection(bm):
                     'is_grid_filled': all_cycles_filled
                 })
                 
+    # 如果是自动栅格填充（由绘制自动触发，或无选择批量填充），过滤掉标记为外包围圈的连通分支
+    is_automatic_fill = is_auto or (not has_selection)
+    if is_automatic_fill:
+        no_auto_layer = bm.edges.layers.int.get("tp_no_auto_fill")
+        if no_auto_layer:
+            filtered_components = []
+            for c in parsed_components:
+                if c['type'] == 'invalid':
+                    filtered_components.append(c)
+                    continue
+                c_edges = c.get('edges', [])
+                if c_edges:
+                    marked_count = sum(1 for e in c_edges if e.is_valid and e[no_auto_layer] == 1)
+                    if (marked_count / len(c_edges)) > 0.5:
+                        continue
+                filtered_components.append(c)
+            parsed_components = filtered_components
+
     # 如果用户没有进行任何选择，则过滤掉已栅格化的和无效的连通分支，只自动填充未填充的有效分支
     if not has_selection:
         parsed_components = [c for c in parsed_components if c['type'] != 'invalid' and not c.get('is_grid_filled', False)]
@@ -318,7 +336,7 @@ def trace_cycle_verts(cycle_edges):
 
 
 
-def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor, spring_factor, selected_verts=None, selected_edges=None):
+def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor, spring_factor, selected_verts=None, selected_edges=None, user_span=0, user_offset=0):
     """
     对非线性拼接圈进行多区域栅格填充
     """
@@ -406,6 +424,16 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
             continue
             
         M, N, offset = best_params
+        
+        # Apply user span override if specified (user_span >= 2)
+        if user_span >= 2:
+            half_L = L // 2
+            N = max(2, min(half_L - 2, user_span))
+            M = half_L - N
+            
+        # Apply user offset override
+        offset = (offset + user_offset) % L
+        
         grid_coords = init_coons_grid(loop_verts, M, N, offset)
         
         optimize_grid(
@@ -976,6 +1004,12 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
     bl_description = "将选中的圈进行高质量的栅格化填充，并优化为均匀的正方形面"
     bl_options = {'REGISTER', 'UNDO'}
     
+    is_auto: bpy.props.BoolProperty(
+        name="是否自动填充",
+        default=False,
+        description="是否由绘制操作自动触发的填充"
+    )
+    
     # 导出可调节的属性，支持重做面板
     iterations: bpy.props.IntProperty(
         name="平滑迭代",
@@ -1007,12 +1041,36 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         description="是否将内部栅格投影贴合到高模物体表面"
     )
     
+    span: bpy.props.IntProperty(
+        name="跨分 (Span)",
+        default=0,
+        min=0,
+        description="栅格一边的网格数。0 表示自动计算（Auto）"
+    )
+    
+    offset: bpy.props.IntProperty(
+        name="偏移 (Offset)",
+        default=0,
+        description="网格顶点的起点偏移量，相对于自动寻找的最佳起点进行偏移"
+    )
+    
     @classmethod
     def poll(cls, context):
         obj = context.active_object
         return obj is not None and obj.type == 'MESH' and obj.mode == 'EDIT'
         
     def execute(self, context):
+        # Sync scene settings with operator properties if they were modified in the Redo panel
+        if self.span == 0 and context.scene.tp_grid_span != 0:
+            self.span = context.scene.tp_grid_span
+        if self.offset == 0 and context.scene.tp_grid_offset != 0:
+            self.offset = context.scene.tp_grid_offset
+            
+        if self.span != context.scene.tp_grid_span:
+            context.scene.tp_grid_span = self.span
+        if self.offset != context.scene.tp_grid_offset:
+            context.scene.tp_grid_offset = self.offset
+
         topo_obj = context.active_object
         if not topo_obj or topo_obj.type != 'MESH':
             self.report({'ERROR'}, "活动对象不是网格体")
@@ -1022,7 +1080,7 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         bm = bmesh.from_edit_mesh(topo_obj.data)
         
         # 1. 提取并分析选中的图形
-        components, err_msg = analyze_selection(bm)
+        components, err_msg = analyze_selection(bm, is_auto=self.is_auto)
         if err_msg:
             self.report({'ERROR'}, err_msg)
             return {'CANCELLED'}
@@ -1075,6 +1133,16 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     return {'CANCELLED'}
                     
                 M, N, offset = best_params
+                
+                # Apply user span override if specified (span >= 2)
+                if self.span >= 2:
+                    half_L = L // 2
+                    N = max(2, min(half_L - 2, self.span))
+                    M = half_L - N
+                    
+                # Apply user offset override
+                offset = (offset + self.offset) % L
+                
                 grid_coords = init_coons_grid(loop_verts, M, N, offset)
                 
                 optimize_grid(
@@ -1141,7 +1209,9 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     smooth_factor=self.smooth_factor,
                     spring_factor=self.spring_factor,
                     selected_verts=selected_verts_extended,
-                    selected_edges=selected_edges_extended
+                    selected_edges=selected_edges_extended,
+                    user_span=self.span,
+                    user_offset=self.offset
                 )
                 joined_filled += 1
                 total_faces += faces_created
@@ -1275,3 +1345,226 @@ class OBJECT_OT_tp_topology_remove_grid(bpy.types.Operator):
         
         self.report({'INFO'}, f"已成功移除栅格，共删除 {total_faces_deleted} 个面。")
         return {'FINISHED'}
+
+
+# --- Real-time Grid Micro-Adjustment from N-Panel ---
+_in_grid_update = False
+
+def on_grid_settings_update(self, context):
+    global _in_grid_update
+    if _in_grid_update:
+        return
+    _in_grid_update = True
+    try:
+        update_last_grid(context)
+    finally:
+        _in_grid_update = False
+
+def update_last_grid(context):
+    import bmesh
+    import bpy
+    from mathutils import Vector
+    
+    topo_obj = context.active_object
+    if not topo_obj or topo_obj.type != 'MESH' or topo_obj.mode != 'EDIT':
+        return
+        
+    bm = bmesh.from_edit_mesh(topo_obj.data)
+    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+    if not grid_layer:
+        return
+        
+    # 获取所有的已填充的 loop ids
+    ids = {f[grid_layer] for f in bm.faces if f[grid_layer] > 0}
+    if not ids:
+        return
+        
+    # 收集用户选择以决定对哪些区域进行参数调整 (参考 "移除栅格" 逻辑)
+    selected_verts = {v for v in bm.verts if v.select}
+    selected_edges = {e for e in bm.edges if e.select}
+    selected_faces = {f for f in bm.faces if f.select}
+    
+    has_selection = bool(selected_verts or selected_edges or selected_faces)
+    
+    IDs_adjust = set()
+    if not has_selection:
+        # 如果未选择任何元素，调整全部已经栅格化的区域 (与"移除栅格"行为完全看齐)
+        IDs_adjust.update(ids)
+    else:
+        # 如果有选择，仅调整与选择元素相交的栅格区域
+        for f in selected_faces:
+            if f[grid_layer] > 0:
+                IDs_adjust.add(f[grid_layer])
+        for e in selected_edges:
+            for f in e.link_faces:
+                if f[grid_layer] > 0:
+                    IDs_adjust.add(f[grid_layer])
+        for v in selected_verts:
+            for f in v.link_faces:
+                if f[grid_layer] > 0:
+                    IDs_adjust.add(f[grid_layer])
+                    
+    if not IDs_adjust:
+        return
+        
+    # 物理记忆：在网格被物理删除重建前，记录选中顶点信息以备后续恢复
+    all_deleted_vert_indices = set()
+    for lid in IDs_adjust:
+        F_loop_temp = [f for f in bm.faces if f[grid_layer] == lid]
+        if F_loop_temp:
+            F_loop_set_temp = set(F_loop_temp)
+            E_loop_all_temp = set()
+            for f in F_loop_set_temp:
+                E_loop_all_temp.update(f.edges)
+            E_boundary_temp = {e for e in E_loop_all_temp if len([f for f in e.link_faces if f[grid_layer] == lid]) == 1}
+            V_boundary_temp = {v for e in E_boundary_temp for v in e.verts}
+            V_internal_temp = {v for f in F_loop_set_temp for v in f.verts} - V_boundary_temp
+            for v in V_internal_temp:
+                all_deleted_vert_indices.add(v.index)
+                
+    # 保留点（不会被删除）的选择状态：记录其顶点索引（Index）
+    keep_selected_indices = [v.index for v in selected_verts if v.index not in all_deleted_vert_indices]
+    
+    # 物理删除点的选择状态：记录其三维局部坐标（Coordinates）
+    deleted_selected_cos = [v.co.copy() for v in selected_verts if v.index in all_deleted_vert_indices]
+
+    # Get span and offset from scene
+    scene = context.scene
+    user_span = scene.tp_grid_span
+    user_offset = scene.tp_grid_offset
+    
+    # Find high-poly reference object
+    ref_obj = None
+    ref_obj_name = context.window_manager.tp_ref_object_name
+    if ref_obj_name:
+        ref_obj = bpy.data.objects.get(ref_obj_name)
+        
+    # 对所有匹配的栅格区域依次执行擦除与重建
+    for lid in IDs_adjust:
+        # Gather all faces with this loop_id
+        F_loop = [f for f in bm.faces if f[grid_layer] == lid]
+        if not F_loop:
+            continue
+            
+        F_loop_set = set(F_loop)
+        E_loop_all = set()
+        for f in F_loop_set:
+            E_loop_all.update(f.edges)
+            
+        E_boundary = {e for e in E_loop_all if len([f for f in e.link_faces if f[grid_layer] == lid]) == 1}
+        V_boundary = {v for e in E_boundary for v in e.verts}
+        
+        E_internal = E_loop_all - E_boundary
+        V_internal = {v for f in F_loop_set for v in f.verts} - V_boundary
+        
+        # Delete internal elements
+        faces_to_delete = [f for f in F_loop if f.is_valid]
+        if faces_to_delete:
+            bmesh.ops.delete(bm, geom=faces_to_delete, context='FACES_ONLY')
+        edges_to_delete = [e for e in E_internal if e.is_valid]
+        if edges_to_delete:
+            bmesh.ops.delete(bm, geom=edges_to_delete, context='EDGES')
+        verts_to_delete = [v for v in V_internal if v.is_valid]
+        if verts_to_delete:
+            bmesh.ops.delete(bm, geom=verts_to_delete, context='VERTS')
+            
+        # Trace the boundary loop to get ordered loop_verts
+        loop_verts = trace_cycle_verts(E_boundary)
+        if not loop_verts:
+            continue
+            
+        # Calculate best parameters
+        L = len(loop_verts)
+        best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
+        if not best_params:
+            continue
+            
+        M, N, offset = best_params
+        
+        if user_span >= 2:
+            half_L = L // 2
+            N = max(2, min(half_L - 2, user_span))
+            M = half_L - N
+            
+        offset = (offset + user_offset) % L
+        
+        # Initialize and optimize grid
+        grid_coords = init_coons_grid(loop_verts, M, N, offset)
+        optimize_grid(
+            grid_coords, M, N,
+            ref_obj=ref_obj,
+            topo_obj=topo_obj,
+            iterations=40,
+            smooth_factor=0.4,
+            spring_factor=0.3
+        )
+        
+        # Create new vertices and faces
+        def get_loop_vert(index):
+            return loop_verts[index % L]
+            
+        grid_verts = [[None for _ in range(N + 1)] for _ in range(M + 1)]
+        grid_verts[0][0] = get_loop_vert(offset)
+        grid_verts[M][0] = get_loop_vert(offset + M)
+        grid_verts[M][N] = get_loop_vert(offset + M + N)
+        grid_verts[0][N] = get_loop_vert(offset + 2 * M + N)
+        
+        for u in range(1, M):
+            grid_verts[u][0] = get_loop_vert(offset + u)
+            grid_verts[u][N] = get_loop_vert(offset + 2 * M + N - u)
+        for v in range(1, N):
+            grid_verts[M][v] = get_loop_vert(offset + M + v)
+            grid_verts[0][v] = get_loop_vert(offset - v)
+            
+        for u in range(1, M):
+            for v in range(1, N):
+                vert = bm.verts.new(grid_coords[u][v])
+                grid_verts[u][v] = vert
+                
+        bm.verts.ensure_lookup_table()
+        
+        # Re-apply the same loop_id
+        for u in range(M):
+            for v in range(N):
+                v00 = grid_verts[u][v]
+                v10 = grid_verts[u+1][v]
+                v11 = grid_verts[u+1][v+1]
+                v01 = grid_verts[u][v+1]
+                try:
+                    f = bm.faces.new((v00, v10, v11, v01))
+                    f[grid_layer] = lid
+                except Exception:
+                    pass
+                    
+        # Recalculate normals for new faces
+        bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+        
+    # === 物理记忆与投影追踪恢复 ===
+    bm.verts.ensure_lookup_table()
+    
+    # 1. 恢复保留点的选中状态
+    for idx in keep_selected_indices:
+        if idx < len(bm.verts):
+            bm.verts[idx].select = True
+            
+    # 2. 针对被物理删除点，通过最近邻算法在重建后的新网格中寻找最佳替代点
+    for old_co in deleted_selected_cos:
+        closest_v = None
+        min_dist = float('inf')
+        for v in bm.verts:
+            dist = (v.co - old_co).length
+            if dist < min_dist:
+                min_dist = dist
+                closest_v = v
+        if closest_v and min_dist < 0.2:
+            closest_v.select = True
+            
+    # 刷新选择历史，确保活动项正确
+    selected_verts_after = [v for v in bm.verts if v.select]
+    if selected_verts_after:
+        bm.select_history.clear()
+        bm.select_history.add(selected_verts_after[-1])
+
+    # Update edit mesh and viewport
+    bmesh.update_edit_mesh(topo_obj.data)
+    context.area.tag_redraw()
