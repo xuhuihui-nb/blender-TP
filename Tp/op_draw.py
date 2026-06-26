@@ -928,6 +928,63 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             context.area.tag_redraw()
                             return {'RUNNING_MODAL'}
                         coord = (event.mouse_region_x, event.mouse_region_y)
+                        
+                        # 只要鼠标在点的吸附范围内，就直接吸附合并，并结束这一笔的绘制
+                        snap_pt, snap_v = self.find_nearest_vertex(context, coord, threshold_pixels=20)
+                        if snap_v is not None:
+                            # 确定起始顶点
+                            start_v_idx = None
+                            if getattr(self, 'start_from_selected_v_idx', None) is not None:
+                                start_v_idx = self.start_from_selected_v_idx
+                            elif self.stroke_snap_indices and self.stroke_snap_indices[0] is not None:
+                                start_v_idx = self.stroke_snap_indices[0]
+                                
+                            should_end = False
+                            if start_v_idx is None:
+                                # 从空白处起笔，吸附到任何已有顶点都立即合并结束
+                                should_end = True
+                            else:
+                                if snap_v != start_v_idx:
+                                    # 吸附到非起点的其他顶点，直接合并结束
+                                    should_end = True
+                                else:
+                                    # 吸附回起点（闭合环线），需要已经拉开距离
+                                    if self.stroke_points:
+                                        region = context.region
+                                        rv3d = context.space_data.region_3d
+                                        p0_2d = location_3d_to_region_2d(region, rv3d, self.stroke_points[0])
+                                        pn_2d = mathutils.Vector(coord)
+                                        if p0_2d and pn_2d:
+                                            dist_from_start = (pn_2d - p0_2d).length
+                                            if dist_from_start > 30 or len(self.stroke_points) >= 3:
+                                                should_end = True
+                                                
+                            if should_end:
+                                # 追加当前吸附点和索引，立即完成绘制
+                                self.stroke_points.append(snap_pt)
+                                self.stroke_snap_indices.append(snap_v)
+                                if len(self.stroke_points) >= 2:
+                                    self.create_geometry(context)
+                                    self.conform_to_surface(context)
+                                    self.rebuild_kd_tree()
+                                    try:
+                                        bpy.ops.ed.undo_push(message="TP 拓扑绘制")
+                                    except Exception as e:
+                                        print("Error pushing undo step:", e)
+                                    self.report({'INFO'}, "已自动吸附合并并完成绘制")
+                                
+                                # 重置所有绘制状态
+                                self.stroke_points = []
+                                self.stroke_snap_indices = []
+                                self.is_drawing = False
+                                self.is_dragging = False
+                                self.is_polyline = False
+                                self.start_from_selected_v_co = None
+                                self.start_from_selected_v_idx = None
+                                self.max_drag_dist_from_start = 0.0
+                                context.area.tag_redraw()
+                                return {'RUNNING_MODAL'}
+                        
                         dx = coord[0] - self.last_mouse_coord_prev[0]
                         dy = coord[1] - self.last_mouse_coord_prev[1]
                         if (dx*dx + dy*dy) ** 0.5 > 12:

@@ -264,9 +264,9 @@ def find_minimum_cycle_basis(bm, comp_verts, comp_edges):
             for idx in range(len(path_found) - 1):
                 v_curr = path_found[idx]
                 v_next = path_found[idx + 1]
-                for edge in adj[v_curr]:
-                    if edge.other_vert(v_curr) == v_next:
-                        cycle_edges.add(edge)
+                for ed in adj[v_curr]:
+                    if ed.other_vert(v_curr) == v_next:
+                        cycle_edges.add(ed)
                         break
             candidate_cycles.append(cycle_edges)
             
@@ -378,8 +378,27 @@ def find_shared_paths(V_i, V_j):
             paths.append(path_verts)
     return paths
 
+def get_grid_side_and_type(corners, u, w):
+    try:
+        idx_u = corners.index(u)
+        idx_w = corners.index(w)
+    except ValueError:
+        return -1, None
+        
+    diff = abs(idx_u - idx_w)
+    if diff == 1 or diff == 3:
+        if (idx_u == 0 and idx_w == 1) or (idx_u == 1 and idx_w == 0):
+            return 0, 'horizontal'
+        elif (idx_u == 1 and idx_w == 2) or (idx_u == 2 and idx_w == 1):
+            return 1, 'vertical'
+        elif (idx_u == 2 and idx_w == 3) or (idx_u == 3 and idx_w == 2):
+            return 2, 'horizontal'
+        else:
+            return 3, 'vertical'
+    return -1, None
 
-def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_obj):
+
+def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_obj, fixed_boundaries=None):
     """
     全局求解拼接圈各子网格的最佳划分参数 (M, N, offset)，使得相邻网格共享边界的 corners 对齐，
     网格流向上下承接，且各个子网格自身的长宽比和角点形态最优。
@@ -387,6 +406,9 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
     num_cycles = len(cycles_verts)
     if num_cycles == 0:
         return []
+        
+    if fixed_boundaries is None:
+        fixed_boundaries = []
         
     # 1. 预计算每个子圈的所有候选参数和其个体评分
     cycle_candidates = []
@@ -443,7 +465,11 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
                         if j in corners:
                             penalty += 1000.0
                             
-                score = ortho_score + 2.0 * aspect_score + penalty
+                # 数量趋于相等的惩罚项 (横边和竖边的数量差值)
+                div_diff_penalty = 5.0 * abs(M - N)
+                
+                # 综合评分：正交偏离 + 长宽比偏离 + 角度惩罚项 + 数量差值惩罚项
+                score = ortho_score + 2.0 * aspect_score + penalty + div_diff_penalty
                 candidates.append({
                     'M': M, 'N': N, 'offset': offset,
                     'score': score,
@@ -531,10 +557,14 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
             elif sb['cycle_b'] == curr_idx and current_params[sb['cycle_a']] is not None:
                 active_boundaries.append((sb, sb['cycle_a']))
                 
+        # 收集该 active 圈与已填充栅格之间的固定边界约束
+        curr_fixed_boundaries = [fb for fb in fixed_boundaries if fb['cycle_active'] == curr_idx]
+                
         for cand in cycle_candidates[curr_idx]:
             compat_cost = 0.0
             aligned = True
             
+            # Active-to-Active 边界兼容性检查
             for sb, neighbor_idx in active_boundaries:
                 neighbor_cand = current_params[neighbor_idx]
                 u, w = sb['endpoints']
@@ -559,9 +589,34 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
                         elif neighbor_side == 3 and curr_side == 1: perfect_match = True
                         
                         if not perfect_match:
-                            compat_cost += 500.0  # 流向反向或错位，但轴向相同，给小惩罚
+                            compat_cost += 2000.0  # 流向反向或错位，但轴向相同，给予惩罚以确保整体流向顺畅
                             
-            if active_boundaries and not aligned and current_score + compat_cost >= best_global_score:
+            # Active-to-Fixed (已填充) 边界兼容性检查
+            for fb in curr_fixed_boundaries:
+                u, w = fb['endpoints']
+                filled_side = fb['filled_side']
+                filled_type = fb['filled_type']
+                
+                curr_side, curr_type = get_shared_side_and_type(cand, u, w)
+                
+                if curr_side == -1:
+                    # 与已存在栅格的角点未对齐，给予严厉惩罚
+                    compat_cost += 10000.0
+                    aligned = False
+                else:
+                    if curr_type != filled_type:
+                        compat_cost += 5000.0
+                    else:
+                        perfect_match = False
+                        if filled_side == 2 and curr_side == 0: perfect_match = True
+                        elif filled_side == 0 and curr_side == 2: perfect_match = True
+                        elif filled_side == 1 and curr_side == 3: perfect_match = True
+                        elif filled_side == 3 and curr_side == 1: perfect_match = True
+                        
+                        if not perfect_match:
+                            compat_cost += 2000.0  # 流向反向或错位，但轴向相同，给予惩罚以确保整体流向顺畅
+                            
+            if (active_boundaries or curr_fixed_boundaries) and not aligned and current_score + compat_cost >= best_global_score:
                 continue
                 
             next_score = current_score + cand['score'] + compat_cost
@@ -579,6 +634,7 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
                 best_global_params[i] = cycle_candidates[i][0]
                 
     return [(p['M'], p['N'], p['offset']) if p else None for p in best_global_params]
+
 
 
 def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3):
@@ -888,11 +944,70 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
             'endpoints': sb['endpoints']
         })
         
-    solved_params = solve_global_grid_parameters(active_loops, mapped_boundaries, ref_obj, topo_obj)
+    # 寻找与待填充圈相邻的、已填充的栅格区域
+    fixed_boundaries = []
+    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+    if grid_layer:
+        shared_filled_loop_ids = set()
+        for idx in active_indices:
+            cycle_edges = cycles[idx]
+            for e in cycle_edges:
+                for f in e.link_faces:
+                    lid = f[grid_layer]
+                    if lid > 0:
+                        shared_filled_loop_ids.add(lid)
+                        
+        for loop_id in shared_filled_loop_ids:
+            F_filled = [f for f in bm.faces if f[grid_layer] == loop_id]
+            if not F_filled:
+                continue
+                
+            F_filled_set = set(F_filled)
+            E_filled_b = []
+            for f in F_filled:
+                for e in f.edges:
+                    if len([lf for lf in e.link_faces if lf in F_filled_set]) == 1:
+                        E_filled_b.append(e)
+            if not E_filled_b:
+                continue
+                
+            try:
+                filled_loop_verts = trace_cycle_verts(E_filled_b)
+            except Exception:
+                continue
+            if not filled_loop_verts:
+                continue
+                
+            # 寻找该已填充区域的 4 个角点
+            corners = []
+            for v in filled_loop_verts:
+                if len([lf for lf in v.link_faces if lf in F_filled_set]) == 1:
+                    corners.append(v)
+            if len(corners) != 4:
+                continue
+                
+            # 计算共享边界的固定约束
+            for idx in active_indices:
+                V_active = cycles_verts[idx]
+                paths = find_shared_paths(V_active, filled_loop_verts)
+                for p in paths:
+                    u, w = p[0], p[-1]
+                    filled_side, filled_type = get_grid_side_and_type(corners, u, w)
+                    if filled_side != -1:
+                        fixed_boundaries.append({
+                            'cycle_active': active_indices.index(idx),
+                            'endpoints': (u, w),
+                            'filled_side': filled_side,
+                            'filled_type': filled_type
+                        })
+                        
+    solved_params = solve_global_grid_parameters(active_loops, mapped_boundaries, ref_obj, topo_obj, fixed_boundaries=fixed_boundaries)
     params_map = {active_indices[k]: solved_params[k] for k in range(len(active_indices))}
     
     # 5. 按照协调好的参数为每个圈独立生成初始 Coons 栅格并拓扑生成面
     faces_total = 0
+    last_span = 0
+    last_offset = 0
     
     for idx in active_indices:
         bm.verts.index_update()
@@ -912,6 +1027,10 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
             M = half_L - N
             
         offset = (offset + user_offset) % L
+        
+        # 记录最后一圈的参数作为最优跨分和偏移的参考
+        last_span = N
+        last_offset = offset
         
         grid_coords = init_coons_grid(loop_verts, M, N, offset)
         optimize_grid(
@@ -966,7 +1085,7 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
                     
         faces_total += faces_created
         
-    return faces_total
+    return faces_total, last_span, last_offset
 
 
 def compute_loop_interior_angles(loop_verts, ref_obj, topo_obj):
@@ -1143,8 +1262,11 @@ def find_best_corners_3d(loop_verts, ref_obj=None, topo_obj=None):
                     if j in corners:
                         penalty += 1000.0
             
-            # 综合评分：正交偏离 + 长宽比偏离 + 规则惩罚项
-            score = ortho_score + 2.0 * aspect_score + penalty
+            # 数量趋于相等的惩罚项 (横边和竖边的数量差值)
+            div_diff_penalty = 5.0 * abs(M - N)
+            
+            # 综合评分：正交偏离 + 长宽比偏离 + 规则惩罚项 + 数量差异惩罚项
+            score = ortho_score + 2.0 * aspect_score + penalty + div_diff_penalty
             
             if score < best_score:
                 best_score = score
@@ -1597,6 +1719,9 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         joined_filled = 0
         total_faces = 0
         
+        last_optimal_span = 0
+        last_optimal_offset = 0
+        
         for comp in components:
             if comp.get('is_grid_filled', False):
                 continue
@@ -1611,6 +1736,10 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     return {'CANCELLED'}
                     
                 M, N, offset = best_params
+                
+                # 记录最优参数
+                last_optimal_span = N
+                last_optimal_offset = offset
                 
                 # Apply user span override if specified (span >= 2)
                 if self.span >= 2:
@@ -1679,7 +1808,7 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                 
             elif comp['type'] == 'non_linear_loops':
                 # 执行非线性多区域填充
-                faces_created = fill_non_linear_loops(
+                faces_created, last_span, last_offset = fill_non_linear_loops(
                     bm, comp,
                     ref_obj=ref_obj,
                     topo_obj=topo_obj,
@@ -1693,6 +1822,9 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                 )
                 joined_filled += 1
                 total_faces += faces_created
+                if last_span >= 2:
+                    last_optimal_span = last_span
+                    last_optimal_offset = last_offset
                 
         # 全局整体调优所有拼接的栅格，确保过渡平滑美观
         global_optimize_spliced_grids(
@@ -1707,6 +1839,16 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         
         # 更新 BMesh 并刷新视图
         bmesh.update_edit_mesh(topo_obj.data)
+        
+        # 如果是自动栅格填充模式，将计算得出的最优跨分与偏移回填写入场景属性中
+        if self.span == 0 and last_optimal_span >= 2:
+            global _in_grid_update
+            _in_grid_update = True
+            try:
+                context.scene.tp_grid_span = last_optimal_span
+                context.scene.tp_grid_offset = last_optimal_offset
+            finally:
+                _in_grid_update = False
         
         # 报告成功信息
         report_msg = "成功填充网格！"
