@@ -2577,7 +2577,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 degrees = {cv: len(adj[cv]) for cv in comp_verts}
                 max_degree = max(degrees.values()) if degrees else 0
                 
-                # Check if it's a simple closed loop
+                # Check if it's a simple closed loop (all vertices degree 2)
                 is_simple_loop = all(d == 2 for d in degrees.values())
                 
                 if is_simple_loop and len(comp_verts) >= 3:
@@ -2616,6 +2616,46 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                 'type': 'open_path',
                                 'verts': ordered_verts
                             })
+                else:
+                    # Complex topology: spliced loops / branching network
+                    # Decompose into arc segments between junction/endpoint vertices.
+                    # Junction vertices: degree != 2 (endpoints deg=1, crossings deg>=3)
+                    junction_verts = {cv for cv, d in degrees.items() if d != 2}
+                    
+                    # Trace each arc: start at a junction vertex, walk through
+                    # degree-2 intermediate vertices until the next junction vertex.
+                    arc_edge_visited = set()
+                    for start_v in junction_verts:
+                        for start_edge in adj.get(start_v, []):
+                            if start_edge in arc_edge_visited or start_edge not in comp_edges:
+                                continue
+                            # Walk this arc
+                            arc_verts = [start_v]
+                            prev_edge = start_edge
+                            arc_edge_visited.add(start_edge)
+                            curr_v = start_edge.other_vert(start_v)
+                            
+                            while curr_v not in junction_verts:
+                                arc_verts.append(curr_v)
+                                # Find the next edge (degree-2 interior vertex has exactly 2 edges)
+                                next_edge = None
+                                for e in adj.get(curr_v, []):
+                                    if e != prev_edge and e in comp_edges:
+                                        next_edge = e
+                                        break
+                                if not next_edge:
+                                    break
+                                arc_edge_visited.add(next_edge)
+                                prev_edge = next_edge
+                                curr_v = next_edge.other_vert(curr_v)
+                            
+                            arc_verts.append(curr_v)  # append the terminal junction vert
+                            
+                            if len(arc_verts) >= 2:
+                                loops.append({
+                                    'type': 'open_path',
+                                    'verts': arc_verts
+                                })
                             
         return loops
 
@@ -2903,10 +2943,12 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     new_edges.append(e)
             bm.edges.ensure_lookup_table()
             
-            vert_indices = [v.index for v in new_verts]
+            # NOTE: indices are captured BEFORE update_edit_mesh — they may be
+            # -1 for newly-created verts. We store the bmesh vert objects
+            # directly so we can re-resolve indices after the mesh is flushed.
             created_loops.append({
                 'type': orig_loop['type'],
-                'vert_indices': vert_indices,
+                'new_verts': new_verts,   # live BMVert refs, resolved after update
                 'loop_id': orig_loop.get('loop_id', None)
             })
             
@@ -2918,6 +2960,13 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             f.select = False
             
         bmesh.update_edit_mesh(topo_obj.data)
+        # index_update() assigns stable indices to all verts (including newly
+        # created ones which have index -1 until this is called).
+        bm.verts.index_update()
+        # Now that the mesh is flushed, resolve stable vert indices
+        bm.verts.ensure_lookup_table()
+        for loop_info in created_loops:
+            loop_info['vert_indices'] = [v.index for v in loop_info['new_verts'] if v.is_valid and v.index >= 0]
         self.rebuild_kd_tree()
         
         try:
@@ -2925,66 +2974,73 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         except Exception as e:
             print("Error pushing undo step during global subdivision:", e)
             
-        # 7. Grid-fill each rasterized loop one by one
+        # 7. Grid-fill all rasterized loops in a SINGLE call so that spliced rings
+        #    (which share boundary vertices) are filled together as a coordinated group.
+        #    Filling them one-by-one fails for spliced pairs: after the first ring is
+        #    filled, its shared-boundary verts are no longer on any wire outer edge, so
+        #    analyze_selection cannot find the second ring's boundary.
         grid_fill_success = True
-        for loop_info in created_loops:
-            if loop_info['type'] == 'rasterized':
-                bm = bmesh.from_edit_mesh(topo_obj.data)
-                bm.verts.ensure_lookup_table()
-                bm.edges.ensure_lookup_table()
-                bm.faces.ensure_lookup_table()
-                
-                for v in bm.verts:
-                    v.select = False
-                for e in bm.edges:
-                    e.select = False
-                for f in bm.faces:
-                    f.select = False
-                    
-                vert_indices = loop_info['vert_indices']
-                bm_verts_to_select = []
-                for idx in vert_indices:
-                    if idx < len(bm.verts):
-                        bm_verts_to_select.append(bm.verts[idx])
-                
-                for v in bm_verts_to_select:
-                    v.select = True
-                
-                vert_set = set(bm_verts_to_select)
-                for e in bm.edges:
-                    if e.verts[0] in vert_set and e.verts[1] in vert_set:
-                        e.select = True
-                        
-                bmesh.update_edit_mesh(topo_obj.data)
-                
-                try:
-                    res = bpy.ops.object.tp_topology_grid_fill()
-                    if 'FINISHED' not in res:
-                        grid_fill_success = False
-                        break
-                    
-                    # Double-check that faces were actually created for this loop
-                    bm_check = bmesh.from_edit_mesh(topo_obj.data)
-                    bm_check.verts.ensure_lookup_table()
-                    has_faces = False
-                    for idx in vert_indices:
-                        if idx < len(bm_check.verts):
-                            if len(bm_check.verts[idx].link_faces) > 0:
-                                has_faces = True
-                                break
-                    if not has_faces:
-                        grid_fill_success = False
-                        break
-                except Exception as e:
-                    print("Error running grid fill during global subdivision:", e)
+        prev_active = context.view_layer.objects.active
+        context.view_layer.objects.active = topo_obj
+        
+        rasterized_loops = [li for li in created_loops if li['type'] == 'rasterized']
+        if rasterized_loops:
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            
+            # Clear all selection first
+            for v in bm.verts:
+                v.select = False
+            for e in bm.edges:
+                e.select = False
+            for f in bm.faces:
+                f.select = False
+            
+            # Select vertices from ALL rasterized loops at once
+            all_selected_verts = set()
+            for loop_info in rasterized_loops:
+                for idx in loop_info['vert_indices']:
+                    if idx >= 0 and idx < len(bm.verts):
+                        bm.verts[idx].select = True
+                        all_selected_verts.add(bm.verts[idx])
+            
+            for e in bm.edges:
+                if e.verts[0] in all_selected_verts and e.verts[1] in all_selected_verts:
+                    e.select = True
+            
+            bmesh.update_edit_mesh(topo_obj.data)
+            
+            try:
+                res = bpy.ops.object.tp_topology_grid_fill()
+                if 'FINISHED' not in res:
                     grid_fill_success = False
-                    break
+            except Exception as e:
+                print("Error running grid fill during global subdivision:", e)
+                grid_fill_success = False
+        # Restore the previously active object
+        if prev_active is not None:
+            try:
+                context.view_layer.objects.active = prev_active
+            except Exception:
+                pass
                     
         if not grid_fill_success:
-            # Restore BMesh from backup
-            bm_backup.to_mesh(topo_obj.data)
-            bmesh.update_edit_mesh(topo_obj.data)
-            bm_backup.free()
+            # Restore BMesh from backup.
+            # bm_backup.to_mesh() raises ValueError when the mesh is in edit
+            # mode, so we route through a temporary mesh that is never linked
+            # to edit mode, then rebuild the live edit bmesh from it.
+            temp_mesh = bpy.data.meshes.new("_tp_backup_restore_tmp")
+            try:
+                bm_backup.to_mesh(temp_mesh)
+                bm_restore = bmesh.from_edit_mesh(topo_obj.data)
+                bm_restore.clear()
+                bm_restore.from_mesh(temp_mesh)
+                bmesh.update_edit_mesh(topo_obj.data)
+            finally:
+                bpy.data.meshes.remove(temp_mesh)
+                bm_backup.free()
             
             # Revert the multiplier
             if event.type == 'WHEELUPMOUSE':

@@ -62,6 +62,9 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
             # 栅格微调面板
             grid_box = col.box()
             grid_box.label(text="栅格微调:", icon='GRID')
+            
+
+            
             grid_box.prop(scene, "tp_grid_span", text="跨分")
             grid_box.prop(scene, "tp_grid_offset", text="偏移")
             

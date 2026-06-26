@@ -637,16 +637,22 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
 
 
 
-def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3):
+def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3, frozen_loop_ids=None):
     """
     对网格中所有已填充的拼接栅格区域进行全局拓扑优化（整体调优）。
     保持最外层边界点不动，释放所有内部顶点以及不同栅格区域之间的共享边界顶点，
     通过拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热 + 贴合投影 + 物理边界碰撞，
     使得所有拼接的栅格过渡平滑自然。
+    
+    frozen_loop_ids: 填充前已存在的 loop_id 集合。属于这些旧圈且不与新圈共享的内部顶点
+    将被固定，防止新绘拼接圈时改变已有圈的形态。
     """
     grid_layer = bm.faces.layers.int.get("tp_is_grid")
     if not grid_layer:
         return
+    
+    if frozen_loop_ids is None:
+        frozen_loop_ids = set()
         
     grid_faces = [f for f in bm.faces if f[grid_layer] > 0]
     if not grid_faces:
@@ -693,6 +699,19 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
         interior_verts = V - boundary_verts
         if not interior_verts:
             continue
+        
+        # 将所有属于旧圈（frozen_loop_ids）的顶点完全固定，包括新旧之间的拼接缝顶点。
+        # 只要一个顶点有任意一个相邻面属于旧圈，该顶点就不能移动，从而完全保护原有圈形态。
+        # 只有所有相邻格面都属于新圈的顶点才可以自由移动。
+        if frozen_loop_ids:
+            frozen_verts = {
+                v for v in interior_verts
+                if any(f[grid_layer] in frozen_loop_ids for f in v.link_faces if f in F)
+            }
+            interior_verts = interior_verts - frozen_verts
+        
+        if not interior_verts:
+            continue
             
         # 计算目标边长 L_target
         scene = bpy.context.scene
@@ -736,7 +755,12 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
                     continue
                     
                 # A. 拉普拉斯平滑
-                pos_lap = sum(curr_cos[nb].copy() for nb, _ in neighbors) / len(neighbors)
+                # sum() defaults to int 0; use a Vector start to avoid
+                # "int + Vector" AttributeError.
+                pos_lap = sum(
+                    (curr_cos[nb].copy() for nb, _ in neighbors),
+                    Vector((0.0, 0.0, 0.0))
+                ) / len(neighbors)
                 
                 # B. 弹簧力项
                 force_spring = Vector((0.0, 0.0, 0.0))
@@ -1084,6 +1108,10 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
                     pass
                     
         faces_total += faces_created
+        
+        # 记录最后一圈的参数作为最优跨分和偏移的参考
+        last_span = N
+        last_offset = offset
         
     return faces_total, last_span, last_offset
 
@@ -1722,6 +1750,16 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         last_optimal_span = 0
         last_optimal_offset = 0
         
+        # Record loop_ids that already exist BEFORE any new filling, so the
+        # global optimizer can leave their interior vertices frozen.
+        grid_layer_pre = bm.faces.layers.int.get("tp_is_grid")
+        pre_existing_loop_ids = set()
+        if grid_layer_pre:
+            for f in bm.faces:
+                lid = f[grid_layer_pre]
+                if lid > 0:
+                    pre_existing_loop_ids.add(lid)
+        
         for comp in components:
             if comp.get('is_grid_filled', False):
                 continue
@@ -1803,6 +1841,10 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                         except Exception:
                             pass
                             
+                # 将最优参数写回全局属性（始终更新，不限 span==0 的情况）
+                last_optimal_span = N
+                last_optimal_offset = offset
+                
                 loops_filled += 1
                 total_faces += faces_created
                 
@@ -1827,11 +1869,14 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     last_optimal_offset = last_offset
                 
         # 全局整体调优所有拼接的栅格，确保过渡平滑美观
+        # Pass pre_existing_loop_ids so the optimizer freezes old grids'
+        # interior vertices and only reshapes the newly added geometry.
         global_optimize_spliced_grids(
             bm, ref_obj, topo_obj,
             iterations=self.iterations,
             smooth_factor=self.smooth_factor,
-            spring_factor=self.spring_factor
+            spring_factor=self.spring_factor,
+            frozen_loop_ids=pre_existing_loop_ids
         )
         
         # 重新计算法线方向，确保显示正常（防止非包裹状态下因法线朝向问题显示为黑色）
@@ -1840,15 +1885,7 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         # 更新 BMesh 并刷新视图
         bmesh.update_edit_mesh(topo_obj.data)
         
-        # 如果是自动栅格填充模式，将计算得出的最优跨分与偏移回填写入场景属性中
-        if self.span == 0 and last_optimal_span >= 2:
-            global _in_grid_update
-            _in_grid_update = True
-            try:
-                context.scene.tp_grid_span = last_optimal_span
-                context.scene.tp_grid_offset = last_optimal_offset
-            finally:
-                _in_grid_update = False
+        # 无需回填参数至全局属性，保持全局属性数值稳定
         
         # 报告成功信息
         report_msg = "成功填充网格！"
@@ -1975,6 +2012,163 @@ class OBJECT_OT_tp_topology_remove_grid(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _find_spliced_constrained_params(bm, grid_layer, lid, loop_verts, all_grid_ids,
+                                     ref_obj, topo_obj, user_span, user_offset):
+    """
+    为拼接圈在调整 span/offset 时，寻找满足共享边界约束的最优 (M, N, offset) 参数。
+
+    确保调整后的圈的 4 个角点仍然包含与邻圈共享边界的端点，从而防止
+    相交边形态被破坏或产生面重叠/折叠现象。
+
+    返回 (M, N, offset) 元组；若未检测到邻圈约束则返回 None（回退到常规逻辑）。
+    """
+    L = len(loop_verts)
+    if L < 6:
+        return None
+    half_L = L // 2
+
+    # 1. 收集必须作为角点的顶点（与各邻圈共享边界的两个端点）
+    must_be_corners = set()
+
+    for other_lid in all_grid_ids:
+        if other_lid == lid:
+            continue
+        F_other = [f for f in bm.faces if f[grid_layer] == other_lid]
+        if not F_other:
+            continue
+        F_other_set = set(F_other)
+
+        # 收集邻圈的边界边和边界顶点
+        E_other_all = set()
+        for f in F_other_set:
+            E_other_all.update(f.edges)
+        E_other_boundary = {
+            e for e in E_other_all
+            if len([f for f in e.link_faces if f in F_other_set]) == 1
+        }
+        V_other_boundary = {v for e in E_other_boundary for v in e.verts}
+
+        # 收集邻圈的角点（仅与该圈恰好 1 个面相连的顶点）
+        V_other_all = {v for f in F_other_set for v in f.verts}
+        other_corners_set = {
+            v for v in V_other_all
+            if sum(1 for f in v.link_faces if f in F_other_set) == 1
+        }
+        if len(other_corners_set) != 4:
+            continue
+
+        # 寻找当前圈与邻圈的共享边界路径
+        paths = find_shared_paths(loop_verts, list(V_other_boundary))
+        for path in paths:
+            if len(path) < 2:
+                continue
+            u, w = path[0], path[-1]
+            # 仅当两端点都是邻圈角点时才施加硬约束
+            if u in other_corners_set and w in other_corners_set:
+                must_be_corners.add(u)
+                must_be_corners.add(w)
+
+    if not must_be_corners:
+        return None  # 无邻圈约束，回退到常规逻辑
+
+    # 2. 生成所有满足角点约束的候选参数并评分
+    interior_angles = compute_loop_interior_angles(loop_verts, ref_obj, topo_obj)
+    coords = [v.co for v in loop_verts]
+
+    valid_candidates = []
+    for M in range(2, half_L - 1):
+        N = half_L - M
+        for offset in range(L):
+            i0 = offset % L
+            i1 = (offset + M) % L
+            i2 = (offset + M + N) % L
+            i3 = (offset + 2 * M + N) % L
+
+            cand_corners_verts = {
+                loop_verts[i0], loop_verts[i1],
+                loop_verts[i2], loop_verts[i3]
+            }
+
+            # 硬约束：候选角点集必须包含所有共享边界端点
+            if not must_be_corners.issubset(cand_corners_verts):
+                continue
+
+            # 评分（与 solve_global_grid_parameters 保持一致）
+            p0, p1, p2, p3 = coords[i0], coords[i1], coords[i2], coords[i3]
+            a = p1 - p0
+            b = p2 - p1
+            c = p3 - p2
+            d = p0 - p3
+            a_len, b_len, c_len, d_len = a.length, b.length, c.length, d.length
+            if min(a_len, b_len, c_len, d_len) < 1e-6:
+                continue
+
+            cos0 = abs(d.dot(a) / (d_len * a_len))
+            cos1 = abs(a.dot(b) / (a_len * b_len))
+            cos2 = abs(b.dot(c) / (b_len * c_len))
+            cos3 = abs(c.dot(d) / (c_len * d_len))
+            ortho_score = cos0 + cos1 + cos2 + cos3
+
+            avg_len_x = (a_len + c_len) / (2.0 * M)
+            avg_len_y = (b_len + d_len) / (2.0 * N)
+            if avg_len_y > 1e-6 and avg_len_x > 1e-6:
+                ratio = avg_len_x / avg_len_y
+                aspect_score = max(ratio, 1.0 / ratio) - 1.0
+            else:
+                aspect_score = 9999.0
+
+            penalty = 0.0
+            corners_idx_set = {i0, i1, i2, i3}
+            for j in range(L):
+                angle = interior_angles[j]
+                if angle < 90.0:
+                    if j not in corners_idx_set:
+                        penalty += 1000.0
+                elif angle > 180.0:
+                    if j in corners_idx_set:
+                        penalty += 1000.0
+
+            div_diff_penalty = 5.0 * abs(M - N)
+
+            # 跨分软偏好：越接近用户设定的目标跨分越好，但不是硬约束
+            span_penalty = 0.0
+            if user_span >= 2:
+                span_diff = abs(N - user_span)
+                span_penalty = 300.0 * span_diff
+
+            score = (ortho_score + 2.0 * aspect_score + penalty
+                     + div_diff_penalty + span_penalty)
+            valid_candidates.append({
+                'M': M, 'N': N, 'offset': offset, 'score': score
+            })
+
+    if not valid_candidates:
+        return None  # 无满足约束的候选，回退到常规逻辑
+
+    # 3. 选出综合评分最优的候选
+    valid_candidates.sort(key=lambda x: x['score'])
+    best = valid_candidates[0]
+    M_best, N_best, offset_best = best['M'], best['N'], best['offset']
+
+    # 4. 在相同 M/N 组合的有效候选中，根据 user_offset 偏好选取最近的合法 offset
+    #    user_offset 被理解为相对于自动最优 offset 的增量，在约束空间内寻找最接近目标的有效值
+    if user_offset != 0:
+        same_mn = [
+            c for c in valid_candidates
+            if c['M'] == M_best and c['N'] == N_best
+        ]
+        if len(same_mn) > 1:
+            target_offset = (offset_best + user_offset) % L
+            same_mn.sort(key=lambda c: min(
+                abs(c['offset'] - target_offset),
+                L - abs(c['offset'] - target_offset)
+            ))
+            chosen = same_mn[0]
+            return chosen['M'], chosen['N'], chosen['offset']
+
+    return M_best, N_best, offset_best
+
+
 # --- Real-time Grid Micro-Adjustment from N-Panel ---
 _in_grid_update = False
 
@@ -2016,8 +2210,8 @@ def update_last_grid(context):
     
     IDs_adjust = set()
     if not has_selection:
-        # 如果未选择任何元素，调整全部已经栅格化的区域 (与"移除栅格"行为完全看齐)
-        IDs_adjust.update(ids)
+        # 未选中任何元素时，不执行全局调整，直接返回
+        return
     else:
         # 如果有选择，仅调整与选择元素相交的栅格区域
         for f in selected_faces:
@@ -2050,8 +2244,8 @@ def update_last_grid(context):
             for v in V_internal_temp:
                 all_deleted_vert_indices.add(v.index)
                 
-    # 保留点（不会被删除）的选择状态：记录其顶点索引（Index）
-    keep_selected_indices = [v.index for v in selected_verts if v.index not in all_deleted_vert_indices]
+    # 保留点（不会被删除）的选择状态：记录其实际 BMVert 对象以避免索引重排导致错选
+    keep_selected_verts = [v for v in selected_verts if v.index not in all_deleted_vert_indices]
     
     # 物理删除点的选择状态：记录其三维局部坐标（Coordinates）
     deleted_selected_cos = [v.co.copy() for v in selected_verts if v.index in all_deleted_vert_indices]
@@ -2101,20 +2295,27 @@ def update_last_grid(context):
         if not loop_verts:
             continue
             
-        # Calculate best parameters
+        # 计算最优参数——对拼接圈优先使用约束求解器
         L = len(loop_verts)
-        best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
-        if not best_params:
-            continue
-            
-        M, N, offset = best_params
-        
-        if user_span >= 2:
-            half_L = L // 2
-            N = max(2, min(half_L - 2, user_span))
-            M = half_L - N
-            
-        offset = (offset + user_offset) % L
+        constrained = _find_spliced_constrained_params(
+            bm, grid_layer, lid, loop_verts, ids,
+            ref_obj, topo_obj, user_span, user_offset
+        )
+        if constrained is not None:
+            # 拼接圈约束模式：角点固定在共享边界端点，相交边形态不变
+            M, N, offset = constrained
+        else:
+            # 孤立圈常规模式（与原有逻辑完全一致）
+            best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
+            if not best_params:
+                continue
+            M, N, offset = best_params
+            if user_span >= 2:
+                half_L = L // 2
+                N = max(2, min(half_L - 2, user_span))
+                M = half_L - N
+            # 直接在自动算出的 offset 基准上叠加用户的相对增量值
+            offset = (offset + user_offset) % L
         
         # Initialize and optimize grid
         grid_coords = init_coons_grid(loop_verts, M, N, offset)
@@ -2168,20 +2369,22 @@ def update_last_grid(context):
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
         
     # 全局整体调优所有拼接的栅格，确保过渡平滑美观
+    # 冻结未被调整的邻圈内部顶点，避免优化过程拉扯相邻圈的形态
     global_optimize_spliced_grids(
         bm, ref_obj, topo_obj,
         iterations=40,
         smooth_factor=0.4,
-        spring_factor=0.3
+        spring_factor=0.3,
+        frozen_loop_ids=ids - IDs_adjust
     )
     
     # === 物理记忆与投影追踪恢复 ===
     bm.verts.ensure_lookup_table()
     
-    # 1. 恢复保留点的选中状态
-    for idx in keep_selected_indices:
-        if idx < len(bm.verts):
-            bm.verts[idx].select = True
+    # 1. 恢复保留点的选中状态（直接使用 BMVert 对象，不受索引重排影响）
+    for v in keep_selected_verts:
+        if v.is_valid:
+            v.select = True
             
     # 2. 针对被物理删除点，通过最近邻算法在重建后的新网格中寻找最佳替代点
     for old_co in deleted_selected_cos:
