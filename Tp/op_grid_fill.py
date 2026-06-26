@@ -637,11 +637,28 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
 
 
 
+def compute_vertex_normal_from_curr_cos(v, F, curr_cos):
+    normal_accum = Vector((0.0, 0.0, 0.0))
+    for f in v.link_faces:
+        if f in F:
+            f_verts = f.verts
+            if len(f_verts) >= 3:
+                co0 = curr_cos[f_verts[0]]
+                co1 = curr_cos[f_verts[1]]
+                co2 = curr_cos[f_verts[2]]
+                f_norm = (co1 - co0).cross(co2 - co0)
+                if f_norm.length > 1e-6:
+                    normal_accum += f_norm.normalized()
+    if normal_accum.length > 1e-6:
+        return normal_accum.normalized()
+    return v.normal.normalized()
+
+
 def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3):
     """
     对网格中所有已填充的拼接栅格区域进行全局拓扑优化（整体调优）。
     保持最外层边界点不动，释放所有内部顶点以及不同栅格区域之间的共享边界顶点，
-    通过拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热 + 贴合投影 + 物理边界碰撞，
+    通过拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热 + 双向射线/最近点贴合投影 + 物理边界碰撞，
     使得所有拼接的栅格过渡平滑自然。
     """
     grid_layer = bm.faces.layers.int.get("tp_is_grid")
@@ -736,7 +753,10 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
                     continue
                     
                 # A. 拉普拉斯平滑
-                pos_lap = sum(curr_cos[nb].copy() for nb, _ in neighbors) / len(neighbors)
+                pos_lap = Vector((0.0, 0.0, 0.0))
+                for nb, _ in neighbors:
+                    pos_lap += curr_cos[nb]
+                pos_lap /= len(neighbors)
                 
                 # B. 弹簧力项
                 force_spring = Vector((0.0, 0.0, 0.0))
@@ -763,19 +783,54 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
                 pos_spring = curr_cos[v] + 0.25 * force_spring
                 relaxed_pos = curr_cos[v].lerp(pos_lap, smooth_factor).lerp(pos_spring, spring_factor)
                 
-                # C. 贴合高模表面
+                # C. 贴合高模表面（使用双向射线投影 + 备用最近点投影）
                 if should_project:
                     try:
-                        world_pos = topo_world @ curr_cos[v]
-                        local_target_pos = matrix_inverse_ref @ world_pos
-                        success, location, normal, index = ref_obj.closest_point_on_mesh(local_target_pos)
+                        grid_normal = compute_vertex_normal_from_curr_cos(v, F, curr_cos)
                         
-                        if success:
-                            normal_world = (matrix_world_ref.to_3x3() @ normal).normalized()
+                        world_pos = topo_world @ curr_cos[v]
+                        world_normal = (topo_world.to_3x3() @ grid_normal).normalized()
+                        
+                        local_origin = matrix_inverse_ref @ world_pos
+                        local_dir = (matrix_inverse_ref.to_3x3() @ world_normal).normalized()
+                        
+                        # 正反双向射线投射
+                        success_f, loc_f, norm_f, idx_f = ref_obj.ray_cast(local_origin, local_dir)
+                        success_b, loc_b, norm_b, idx_b = ref_obj.ray_cast(local_origin, -local_dir)
+                        
+                        max_ray_dist = 4.0 * avg_boundary_len
+                        
+                        hit_pos = None
+                        hit_normal = None
+                        is_raycast = False
+                        
+                        dist_f = (loc_f - local_origin).length if success_f else float('inf')
+                        dist_b = (loc_b - local_origin).length if success_b else float('inf')
+                        
+                        if dist_f < dist_b and dist_f < max_ray_dist:
+                            hit_pos = loc_f
+                            hit_normal = norm_f
+                            is_raycast = True
+                        elif dist_b < max_ray_dist:
+                            hit_pos = loc_b
+                            hit_normal = norm_b
+                            is_raycast = True
+                            
+                        if hit_pos is None:
+                            # 备用方案：高模表面最近点
+                            success_cp, loc_cp, norm_cp, idx_cp = ref_obj.closest_point_on_mesh(local_origin)
+                            if success_cp:
+                                hit_pos = loc_cp
+                                hit_normal = norm_cp
+                                
+                        if hit_pos is not None and hit_normal is not None:
+                            normal_world = (matrix_world_ref.to_3x3() @ hit_normal).normalized()
+                            world_hit_pos = matrix_world_ref @ hit_pos
+                            
                             world_relaxed = topo_world @ relaxed_pos
-                            disp = world_relaxed - world_pos
+                            disp = world_relaxed - world_hit_pos
                             disp_tangent = disp - disp.dot(normal_world) * normal_world
-                            world_relaxed_tangent = world_pos + disp_tangent
+                            world_relaxed_tangent = world_hit_pos + disp_tangent
                             
                             local_target_tangent = matrix_inverse_ref @ world_relaxed_tangent
                             success_snap, location_snap, normal_snap, index_snap = ref_obj.closest_point_on_mesh(local_target_tangent)
@@ -783,7 +838,8 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
                             if success_snap:
                                 local_pt = location_snap + normal_snap * 0.003
                                 projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
-                                if (projected_pos - relaxed_pos).length < 2.0 * avg_boundary_len:
+                                
+                                if is_raycast or (projected_pos - relaxed_pos).length < 2.0 * avg_boundary_len:
                                     relaxed_pos = projected_pos
                     except Exception:
                         pass
@@ -793,6 +849,7 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
                     min_dist_sq = float('inf')
                     best_proj = None
                     best_inward = None
+                    best_ab_len = 0.0
                     
                     for e in boundary_edges:
                         p_curr = curr_cos[e.verts[0]]
@@ -812,12 +869,14 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
                             min_dist_sq = dist_sq
                             best_proj = proj
                             best_inward = boundary_inwards.get(e, Vector((0.0, 0.0, 1.0)))
+                            best_ab_len = math.sqrt(ab_len_sq)
                             
-                    margin = 0.15 * avg_boundary_len
+                    # 设定防穿透自适应局部物理厚度保护
+                    local_margin = 0.15 * min(avg_boundary_len, best_ab_len)
                     V_vec = relaxed_pos - best_proj
                     dot_val = V_vec.dot(best_inward)
-                    if dot_val < margin:
-                        relaxed_pos = best_proj + best_inward * margin
+                    if dot_val < local_margin:
+                        relaxed_pos = best_proj + best_inward * local_margin
                         
                 v.co = relaxed_pos
 
@@ -1262,7 +1321,7 @@ def find_best_corners_3d(loop_verts, ref_obj=None, topo_obj=None):
                     if j in corners:
                         penalty += 1000.0
             
-            # 数量趋于相等的惩罚项 (横边和竖边的数量差值)
+            # 数量趋于相等的惩罚项 (横边 and 竖边的数量差值)
             div_diff_penalty = 5.0 * abs(M - N)
             
             # 综合评分：正交偏离 + 长宽比偏离 + 规则惩罚项 + 数量差异惩罚项
@@ -1296,7 +1355,7 @@ def init_coons_grid(loop_verts, M, N, offset):
     grid_coords[M][N] = get_loop_vert(i2).co.copy()
     grid_coords[0][N] = get_loop_vert(i3).co.copy()
     
-    # 填充 4 条边界曲线坐标
+    # 填充 4 条边界物理曲线坐标
     for u in range(1, M):
         grid_coords[u][0] = get_loop_vert(i0 + u).co.copy()
         grid_coords[u][N] = get_loop_vert(i3 - u).co.copy()
@@ -1334,16 +1393,16 @@ def init_coons_grid(loop_verts, M, N, offset):
 
 def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3):
     """
-    拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热机制 + 投影切平面松弛与距离保护
+    拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热机制 + 渐进式拓扑拉力控制 + 双向射线/最近点贴合投影 + 物理边界碰撞与安全守护
     """
-    # 估算网格的整体法线方向，用于边界碰撞检测
+    # 估算网格的整体法线方向，用于边界碰撞检测与默认投影方向
     c00 = grid_coords[0][0]
     c10 = grid_coords[M][0]
     c01 = grid_coords[0][N]
     normal_dir = (c10 - c00).cross(c01 - c00).normalized()
     
     # 1. 预计算每个网格边局部的目标长度
-    # 计算四条边界的各段弦长
+    # 计算四条边界 of 各段弦长
     # Bottom 边界 (v = 0): u = 0..M-1
     L_bottom = [0.0] * M
     for u in range(M):
@@ -1427,6 +1486,15 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_fa
             for v in range(1, N):
                 pos = curr_coords[u][v]
                 
+                # 计算局部网格法线，用于投影和边界碰撞检测（提取到最前面，保证全局可用且最新）
+                tangent_u = curr_coords[u+1][v] - curr_coords[u-1][v]
+                tangent_v = curr_coords[u][v+1] - curr_coords[u][v-1]
+                cross_prod = tangent_u.cross(tangent_v)
+                if cross_prod.length > 1e-6:
+                    grid_normal = cross_prod.normalized()
+                else:
+                    grid_normal = normal_dir.copy()
+                
                 # 获取直连邻居
                 n_left = curr_coords[u-1][v]
                 n_right = curr_coords[u+1][v]
@@ -1493,45 +1561,8 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_fa
                 # 混合拉普拉斯和自适应弹簧力
                 relaxed_pos = pos.lerp(pos_lap, smooth_factor).lerp(pos_spring, spring_factor)
                 
-                # C. 贴合高模表面（使用切向平滑以防投影挤压折叠）
-                if should_project:
-                    try:
-                        # 1. 转换当前位置到高模空间，获取高模表面的法线
-                        world_pos = topo_world @ pos
-                        local_target_pos = matrix_inverse_ref @ world_pos
-                        success, location, normal, index = ref_obj.closest_point_on_mesh(local_target_pos)
-                        
-                        if success:
-                            # 转换法线到世界空间
-                            normal_world = (matrix_world_ref.to_3x3() @ normal).normalized()
-                            
-                            # 计算 3D 松弛位移在世界空间下的向量
-                            world_relaxed = topo_world @ relaxed_pos
-                            disp = world_relaxed - world_pos
-                            
-                            # 2. 将位移投影到切面，即移除垂直于表面法线的分量
-                            disp_tangent = disp - disp.dot(normal_world) * normal_world
-                            world_relaxed_tangent = world_pos + disp_tangent
-                            
-                            # 3. 将切向平滑后的位置重新贴合投影到高模表面
-                            local_target_tangent = matrix_inverse_ref @ world_relaxed_tangent
-                            success_snap, location_snap, normal_snap, index_snap = ref_obj.closest_point_on_mesh(local_target_tangent)
-                            
-                            if success_snap:
-                                local_pt = location_snap + normal_snap * 0.003
-                                projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
-                                
-                                # 限制最大投影偏移差，防止夸张跨空腔变形
-                                if (projected_pos - relaxed_pos).length < 2.0 * avg_boundary_len:
-                                    relaxed_pos = projected_pos
-                    except Exception:
-                        pass
-                        
-                # D. 边界安全保护，防止凹陷边界处的网格折叠与穿透。
-                # 采用渐进式拓扑拉力控制（Barycentric Restorative Pull），计算节点在行列方向的相对投影比例，
-                # 在每次松弛时，轻轻（15% 力度）将其拉向理想的拓扑相对位置（y_target 和 x_target）。
-                # 该拉力仅沿行/列方向作用，完全保留了法向与切向的横向起伏，防止网格列坍缩，实现网格自然收拢且无重叠。
-                
+                # C. 渐进式拓扑拉力控制（Barycentric Restorative Pull）
+                # 放在投影之前，使其作为一种松弛力，通过投影贴合到表面上，防止拉力导致顶点下陷到模型内部
                 B = grid_coords[u][0]
                 T = grid_coords[u][N]
                 col_vec = T - B
@@ -1547,13 +1578,13 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_fa
                     t_new = t + 0.15 * (y_target - t)
                     relaxed_pos = relaxed_pos + ((t_new - t) * col_len) * col_dir
                         
-                L = grid_coords[0][v]
-                R = grid_coords[M][v]
-                row_vec = R - L
+                L_bound = grid_coords[0][v]
+                R_bound = grid_coords[M][v]
+                row_vec = R_bound - L_bound
                 row_len = row_vec.length
                 if row_len > 1e-6:
                     row_dir = row_vec / row_len
-                    diff = relaxed_pos - L
+                    diff = relaxed_pos - L_bound
                     s_val = diff.dot(row_dir)
                     s = s_val / row_len
                     x_target = u / M
@@ -1561,12 +1592,77 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_fa
                     # 仅在横向上往理想拓扑宽度微调，防止列重叠
                     s_new = s + 0.15 * (x_target - s)
                     relaxed_pos = relaxed_pos + ((s_new - s) * row_len) * row_dir
-                    
+
+                # D. 贴合高模表面（使用双向射线投影 + 备用最近点投影）
+                if should_project:
+                    try:
+                        # 转换当前位置到高模空间，获取投影射线起点与方向
+                        world_pos = topo_world @ pos
+                        world_normal = (topo_world.to_3x3() @ grid_normal).normalized()
+                        
+                        local_origin = matrix_inverse_ref @ world_pos
+                        local_dir = (matrix_inverse_ref.to_3x3() @ world_normal).normalized()
+                        
+                        # 在正反两个方向进行射线求交
+                        success_f, loc_f, norm_f, idx_f = ref_obj.ray_cast(local_origin, local_dir)
+                        success_b, loc_b, norm_b, idx_b = ref_obj.ray_cast(local_origin, -local_dir)
+                        
+                        max_ray_dist = max(M, N) * avg_boundary_len * 2.5
+                        
+                        hit_pos = None
+                        hit_normal = None
+                        is_raycast = False
+                        
+                        dist_f = (loc_f - local_origin).length if success_f else float('inf')
+                        dist_b = (loc_b - local_origin).length if success_b else float('inf')
+                        
+                        # 优先选择距离较近且在合理范围内的交点
+                        if dist_f < dist_b and dist_f < max_ray_dist:
+                            hit_pos = loc_f
+                            hit_normal = norm_f
+                            is_raycast = True
+                        elif dist_b < max_ray_dist:
+                            hit_pos = loc_b
+                            hit_normal = norm_b
+                            is_raycast = True
+                            
+                        if hit_pos is None:
+                            # 备用方案：寻找高模表面最近点
+                            success_cp, loc_cp, norm_cp, idx_cp = ref_obj.closest_point_on_mesh(local_origin)
+                            if success_cp:
+                                hit_pos = loc_cp
+                                hit_normal = norm_cp
+                                
+                        if hit_pos is not None and hit_normal is not None:
+                            normal_world = (matrix_world_ref.to_3x3() @ hit_normal).normalized()
+                            world_hit_pos = matrix_world_ref @ hit_pos
+                            
+                            # 切向松弛投影
+                            world_relaxed = topo_world @ relaxed_pos
+                            disp = world_relaxed - world_hit_pos
+                            disp_tangent = disp - disp.dot(normal_world) * normal_world
+                            world_relaxed_tangent = world_hit_pos + disp_tangent
+                            
+                            local_target_tangent = matrix_inverse_ref @ world_relaxed_tangent
+                            success_snap, location_snap, normal_snap, index_snap = ref_obj.closest_point_on_mesh(local_target_tangent)
+                            
+                            if success_snap:
+                                local_pt = location_snap + normal_snap * 0.003
+                                projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
+                                
+                                # 如果是通过射线投射找到的，直接采纳；如果是备用最近点，保留距离安全限制
+                                if is_raycast or (projected_pos - relaxed_pos).length < 2.0 * avg_boundary_len:
+                                    relaxed_pos = projected_pos
+                    except Exception:
+                        pass
+
                 # E. 物理边界碰撞与安全守护 (Boundary Collision Guard)
-                # 通过三维空间边界段距离和内法线判断，确保顶点绝对不能越过或贴死任意一条边界边。
+                # 使用局部网格法线 grid_normal 代替全局法线 normal_dir，确保在陡峭表面上 inward 方向始终指向网格内部。
+                # 设定防穿透物理厚度保护（自适应局部边长，防止在狭窄区域过度排斥导致网格折叠与畸变）。
                 min_dist_sq = float('inf')
                 best_proj = None
                 best_inward = None
+                best_ab_len = 0.0
                 
                 for idx in range(len(boundary_loop)):
                     p_curr = boundary_loop[idx]
@@ -1586,14 +1682,15 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_fa
                         min_dist_sq = dist_sq
                         best_proj = proj
                         edge_dir = AB.normalized() if ab_len_sq > 1e-12 else Vector((1.0, 0.0, 0.0))
-                        best_inward = normal_dir.cross(edge_dir).normalized()
+                        best_inward = grid_normal.cross(edge_dir).normalized()
+                        best_ab_len = math.sqrt(ab_len_sq)
                         
-                # 设定防穿透物理厚度保护（设为边界平均边长的 15%）
-                margin = 0.15 * avg_boundary_len
-                V = relaxed_pos - best_proj
-                dot = V.dot(best_inward)
-                if dot < margin:
-                    relaxed_pos = best_proj + best_inward * margin
+                # 设定防穿透自适应局部物理厚度保护
+                local_margin = 0.15 * min(avg_boundary_len, best_ab_len)
+                V_collision = relaxed_pos - best_proj
+                dot_collision = V_collision.dot(best_inward)
+                if dot_collision < local_margin:
+                    relaxed_pos = best_proj + best_inward * local_margin
                         
                 grid_coords[u][v] = relaxed_pos
 
