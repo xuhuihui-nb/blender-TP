@@ -61,8 +61,7 @@ def register():
         min=0.0,
         max=1.0,
         precision=2,
-        step=5.0,
-        update=op_grid_fill.on_grid_settings_update
+        step=5.0
     )
     bpy.types.Scene.tp_use_wrap = bpy.props.BoolProperty(
         name="包裹",
