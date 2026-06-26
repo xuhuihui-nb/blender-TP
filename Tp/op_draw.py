@@ -2083,7 +2083,10 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 
                 # Run the grid fill operator
                 try:
-                    bpy.ops.object.tp_topology_grid_fill(is_auto=True)
+                    bpy.ops.object.tp_topology_grid_fill(
+                        is_auto=True, 
+                        smooth_factor=context.scene.tp_smooth_factor
+                    )
                 except Exception as e:
                     print("Auto grid fill error:", e)
                 

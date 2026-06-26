@@ -159,9 +159,13 @@ def analyze_selection(bm, is_auto=False):
                     'err': f"选中的循环边顶点数太少（当前为 {len(loop_verts)}），栅格填充至少需要 8 个顶点。"
                 })
             elif len(loop_verts) % 2 != 0:
+                # 允许奇数圈，后面执行填充时会自动进行自适应细分以转为偶数圈
                 parsed_components.append({
-                    'type': 'invalid',
-                    'err': f"选中的循环边顶点数必须为偶数（当前为 {len(loop_verts)}）。"
+                    'type': 'loop',
+                    'verts': comp_verts,
+                    'edges': comp_edges,
+                    'loop_verts': loop_verts,
+                    'is_grid_filled': check_is_grid_filled(bm, loop_verts, comp_edges)
                 })
             else:
                 parsed_components.append({
@@ -396,6 +400,66 @@ def get_grid_side_and_type(corners, u, w):
         else:
             return 3, 'vertical'
     return -1, None
+def find_fixed_boundaries_for_loop(bm, loop_verts, cycle_edges, active_cycle_idx=0):
+    """
+    找出给定的 loop_verts 和 cycle_edges 与现有已填充栅格区域之间的所有共享固定边界约束。
+    """
+    fixed_boundaries = []
+    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+    if not grid_layer:
+        return fixed_boundaries
+        
+    shared_filled_loop_ids = set()
+    for e in cycle_edges:
+        for f in e.link_faces:
+            lid = f[grid_layer]
+            if lid > 0:
+                shared_filled_loop_ids.add(lid)
+                
+    for loop_id in shared_filled_loop_ids:
+        F_filled = [f for f in bm.faces if f[grid_layer] == loop_id]
+        if not F_filled:
+            continue
+            
+        F_filled_set = set(F_filled)
+        E_filled_b = []
+        for f in F_filled:
+            for e in f.edges:
+                if len([lf for lf in e.link_faces if lf in F_filled_set]) == 1:
+                    E_filled_b.append(e)
+        if not E_filled_b:
+            continue
+            
+        try:
+            filled_loop_verts = trace_cycle_verts(E_filled_b)
+        except Exception:
+            continue
+        if not filled_loop_verts:
+            continue
+            
+        # 寻找该已填充区域 of 4 个角点
+        corners = []
+        for v in filled_loop_verts:
+            if len([lf for lf in v.link_faces if lf in F_filled_set]) == 1:
+                corners.append(v)
+        if len(corners) != 4:
+            continue
+            
+        # 计算共享边界的固定约束
+        paths = find_shared_paths(loop_verts, filled_loop_verts)
+        for p in paths:
+            if len(p) >= 2:
+                u, w = p[0], p[-1]
+                filled_side, filled_type = get_grid_side_and_type(corners, u, w)
+                if filled_side != -1:
+                    fixed_boundaries.append({
+                        'cycle_active': active_cycle_idx,
+                        'endpoints': (u, w),
+                        'filled_side': filled_side,
+                        'filled_type': filled_type
+                    })
+                
+    return fixed_boundaries
 
 
 def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_obj, fixed_boundaries=None):
@@ -409,6 +473,13 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
         
     if fixed_boundaries is None:
         fixed_boundaries = []
+        
+    # 找出所有分界点/接缝端点 (Junctions) 作为角点强引导约束
+    junction_verts = set()
+    for sb in shared_boundaries:
+        junction_verts.update(sb['endpoints'])
+    for fb in fixed_boundaries:
+        junction_verts.update(fb['endpoints'])
         
     # 1. 预计算每个子圈的所有候选参数和其个体评分
     cycle_candidates = []
@@ -457,7 +528,14 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
                 penalty = 0.0
                 corners = {i0, i1, i2, i3}
                 for j in range(L):
+                    v = loop_verts[j]
                     angle = interior_angles[j]
+                    
+                    # 如果该顶点是分界接缝端点 (Junction)，它在拓扑上被允许成为天然角点：
+                    # 仅豁免其大于 180 度的角点惩罚，但绝不强加未选中的大惩罚，以防在接缝极短时导致网格严重扭曲折叠。
+                    if v in junction_verts:
+                        continue
+                        
                     if angle < 90.0:
                         if j not in corners:
                             penalty += 1000.0
@@ -477,8 +555,8 @@ def solve_global_grid_parameters(cycles_verts, shared_boundaries, ref_obj, topo_
                 })
                 
         candidates.sort(key=lambda x: x['score'])
-        # 保留前 40 个最优秀的个体作为候选，既保证求解质量，又限制搜索树宽度
-        cycle_candidates.append(candidates[:40])
+        # 保留前 200 个最优秀的个体作为候选，防止优秀对齐个体被提前过滤
+        cycle_candidates.append(candidates[:200])
         
     # 2. 决定回溯搜索的圈拓扑顺序 (BFS 连通树构建)
     visited = set()
@@ -702,28 +780,42 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
         F = set(comp_faces)
         V = {v for f in F for v in f.verts}
         
-        # 找出该分支的边界边：只连接了 F 中一个面的边
-        boundary_edges = {e for e in bm.edges if len([f for f in e.link_faces if f in F]) == 1}
-        boundary_verts = {v for e in boundary_edges for v in e.verts}
+        # 1. 找出最外层整体连通分支的物理边界边（只连接了 F 中一个面的边）
+        # 这是用于物理碰撞和边缘厚度保护的边界边，不应该包含内部缝合线/共享边，否则会导致单侧碰撞力穿透
+        E_comp_b = {e for e in bm.edges if len([f for f in e.link_faces if f in F]) == 1}
+        boundary_edges = E_comp_b
         
-        # 内部顶点和内部共享边界顶点可以自由移动
+        # 2. 找出每个独立栅格区域（由 face[grid_layer] 标识）的边界顶点，以及最外层的边界顶点
+        # 将它们全部加入固定顶点集合（boundary_verts），确保所有外圈和缝合线保持原有形状，不参与平滑优化
+        boundary_verts = {v for e in E_comp_b for v in e.verts}
+        
+        loop_ids = {f[grid_layer] for f in F if f[grid_layer] > 0}
+        for lid in loop_ids:
+            F_lid = {f for f in F if f[grid_layer] == lid}
+            E_lid_b = {e for e in bm.edges if len([f for f in e.link_faces if f in F_lid]) == 1}
+            boundary_verts.update({v for e in E_lid_b for v in e.verts})
+            
+        # 3. 收集被用户固定的点 (tp_is_pinned) 确保绝对不移动
+        pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+        if pin_layer:
+            boundary_verts.update({v for v in V if v[pin_layer] == 1})
+            
+        # 内部顶点可以自由移动
         interior_verts = V - boundary_verts
         if not interior_verts:
             continue
             
-        # 计算目标边长 L_target
-        scene = bpy.context.scene
-        L_target = getattr(scene, "tp_edge_length", 0.05)
-        if L_target < 0.001:
-            if boundary_edges:
-                L_target = sum(e.calc_length() for e in boundary_edges) / len(boundary_edges)
+        # 计算目标边长 L_target（直接使用边界边的平均长度，实现尺度的自适应，防止因为与 tp_edge_length 尺度不匹配导致网格产生剧烈的收缩折叠）
+        if boundary_edges:
+            L_target = sum(e.calc_length() for e in boundary_edges) / len(boundary_edges)
+        else:
+            all_edges = {e for f in F for e in f.edges}
+            if all_edges:
+                L_target = sum(e.calc_length() for e in all_edges) / len(all_edges)
             else:
                 L_target = 0.05
                 
-        if boundary_edges:
-            avg_boundary_len = sum(e.calc_length() for e in boundary_edges) / len(boundary_edges)
-        else:
-            avg_boundary_len = L_target
+        avg_boundary_len = L_target
             
         # 预计算每个边界边的向内法线
         boundary_inwards = {}
@@ -915,20 +1007,31 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
                     edge_counts[e] = edge_counts.get(e, 0) + 1
                         
             best_edge = None
+            min_faces = 99999
             min_count = 99999
             max_len = -1.0
             
             for e in cycle_edges:
+                num_faces = len(e.link_faces)
                 count = edge_counts.get(e, 1)
-                if count < min_count:
+                
+                # 优先选择未连接任何面（即 len(e.link_faces) == 0 的纯外围线）的边进行细分，
+                # 绝对避免细分已经与现有网格连接的共享边界/缝合线，防止破坏已有网格产生三角形。
+                if num_faces < min_faces:
+                    min_faces = num_faces
                     min_count = count
                     best_edge = e
                     max_len = e.calc_length()
-                elif count == min_count:
-                    l = e.calc_length()
-                    if l > max_len:
-                        max_len = l
+                elif num_faces == min_faces:
+                    if count < min_count:
+                        min_count = count
                         best_edge = e
+                        max_len = e.calc_length()
+                    elif count == min_count:
+                        l = e.calc_length()
+                        if l > max_len:
+                            max_len = l
+                            best_edge = e
                         
             if best_edge:
                 res = bmesh.ops.subdivide_edges(bm, edges=[best_edge], cuts=1)
@@ -1003,62 +1106,11 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
             'endpoints': sb['endpoints']
         })
         
-    # 寻找与待填充圈相邻的、已填充的栅格区域
+    # 寻找与待填充圈相邻的、已填充的栅格区域，获取固定边界约束
     fixed_boundaries = []
-    grid_layer = bm.faces.layers.int.get("tp_is_grid")
-    if grid_layer:
-        shared_filled_loop_ids = set()
-        for idx in active_indices:
-            cycle_edges = cycles[idx]
-            for e in cycle_edges:
-                for f in e.link_faces:
-                    lid = f[grid_layer]
-                    if lid > 0:
-                        shared_filled_loop_ids.add(lid)
-                        
-        for loop_id in shared_filled_loop_ids:
-            F_filled = [f for f in bm.faces if f[grid_layer] == loop_id]
-            if not F_filled:
-                continue
-                
-            F_filled_set = set(F_filled)
-            E_filled_b = []
-            for f in F_filled:
-                for e in f.edges:
-                    if len([lf for lf in e.link_faces if lf in F_filled_set]) == 1:
-                        E_filled_b.append(e)
-            if not E_filled_b:
-                continue
-                
-            try:
-                filled_loop_verts = trace_cycle_verts(E_filled_b)
-            except Exception:
-                continue
-            if not filled_loop_verts:
-                continue
-                
-            # 寻找该已填充区域的 4 个角点
-            corners = []
-            for v in filled_loop_verts:
-                if len([lf for lf in v.link_faces if lf in F_filled_set]) == 1:
-                    corners.append(v)
-            if len(corners) != 4:
-                continue
-                
-            # 计算共享边界的固定约束
-            for idx in active_indices:
-                V_active = cycles_verts[idx]
-                paths = find_shared_paths(V_active, filled_loop_verts)
-                for p in paths:
-                    u, w = p[0], p[-1]
-                    filled_side, filled_type = get_grid_side_and_type(corners, u, w)
-                    if filled_side != -1:
-                        fixed_boundaries.append({
-                            'cycle_active': active_indices.index(idx),
-                            'endpoints': (u, w),
-                            'filled_side': filled_side,
-                            'filled_type': filled_type
-                        })
+    for k, idx in enumerate(active_indices):
+        fb_for_cycle = find_fixed_boundaries_for_loop(bm, cycles_verts[idx], cycles[idx], active_cycle_idx=k)
+        fixed_boundaries.extend(fb_for_cycle)
                         
     solved_params = solve_global_grid_parameters(active_loops, mapped_boundaries, ref_obj, topo_obj, fixed_boundaries=fixed_boundaries)
     params_map = {active_indices[k]: solved_params[k] for k in range(len(active_indices))}
@@ -1080,12 +1132,20 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
         
         M, N, offset = params_map[idx]
         
-        if user_span >= 2:
-            half_L = L // 2
-            N = max(2, min(half_L - 2, user_span))
-            M = half_L - N
+        # 检查该子圈是否涉及任何固定或共享边界约束。如果有，则不允许用户通过 slider 强行覆盖参数，以保全缝合拓扑。
+        k_mapped = active_indices.index(idx)
+        has_constraints = False
+        if any(fb['cycle_active'] == k_mapped for fb in fixed_boundaries):
+            has_constraints = True
+        if any(sb['cycle_a'] == k_mapped or sb['cycle_b'] == k_mapped for sb in mapped_boundaries):
+            has_constraints = True
             
-        offset = (offset + user_offset) % L
+        if not has_constraints:
+            if user_span >= 2:
+                half_L = L // 2
+                N = max(2, min(half_L - 2, user_span))
+                M = half_L - N
+            offset = (offset + user_offset) % L
         
         # 记录最后一圈的参数作为最优跨分和偏移的参考
         last_span = N
@@ -1246,6 +1306,25 @@ def compute_loop_interior_angles(loop_verts, ref_obj, topo_obj):
     return interior_angles
 
 
+def find_loop_junctions(loop_verts):
+    """
+    辅助函数：找出单闭合圈上的接缝端点（即与已存在网格连接的转折点/分界点）
+    """
+    L = len(loop_verts)
+    junctions = set()
+    for i in range(L):
+        v = loop_verts[i]
+        # 判断当前顶点是否已连接面片
+        has_faces = len(v.link_faces) > 0
+        if has_faces:
+            v_prev = loop_verts[(i - 1) % L]
+            v_next = loop_verts[(i + 1) % L]
+            # 如果环上相邻的顶点中，至少有一个没有连接任何面，说明当前点是接缝的边界/端点
+            if len(v_prev.link_faces) == 0 or len(v_next.link_faces) == 0:
+                junctions.add(v)
+    return junctions
+
+
 def find_best_corners_3d(loop_verts, ref_obj=None, topo_obj=None):
     """
     在 3D 空间中直接搜索最佳的角点分段参数 (M, N, offset)，避免 2D 投影引起的拉伸失真。
@@ -1255,6 +1334,9 @@ def find_best_corners_3d(loop_verts, ref_obj=None, topo_obj=None):
     """
     L = len(loop_verts)
     interior_angles = compute_loop_interior_angles(loop_verts, ref_obj, topo_obj)
+    
+    # 找出所有分界点/接缝端点 (Junctions) 作为角点强引导约束
+    junction_verts = find_loop_junctions(loop_verts)
     
     best_score = float('inf')
     best_params = None
@@ -1310,10 +1392,18 @@ def find_best_corners_3d(loop_verts, ref_obj=None, topo_obj=None):
             # 引入角度限制规则的惩罚项：
             # 1. 小于 90 度的顶点不可以接新边（必须成为 4 个角点之一）
             # 2. 大于 180 度的顶点必须接一条新边（绝不能是角点）
+            # 3. 特殊情况：如果是接缝端点，强制允许且引导其成为角点
             penalty = 0.0
             corners = {i0, i1, i2, i3}
             for j in range(L):
+                v = loop_verts[j]
                 angle = interior_angles[j]
+                
+                # 如果该顶点是分界接缝端点 (Junction)，它在拓扑上被允许成为天然角点：
+                # 仅豁免其大于 180 度的角点惩罚，以防在接缝极短时导致网格严重扭曲折叠。
+                if v in junction_verts:
+                    continue
+                    
                 if angle < 90.0:
                     if j not in corners:
                         penalty += 1000.0
@@ -1756,7 +1846,15 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         obj = context.active_object
         return obj is not None and obj.type == 'MESH' and obj.mode == 'EDIT'
         
+    def invoke(self, context, event):
+        self.smooth_factor = context.scene.tp_smooth_factor
+        return self.execute(context)
+        
     def execute(self, context):
+        global _in_grid_update
+        if self.is_auto:
+            self.smooth_factor = context.scene.tp_smooth_factor
+            
         # Sync scene settings with operator properties if they were modified in the Redo panel
         if self.span == 0 and context.scene.tp_grid_span != 0:
             self.span = context.scene.tp_grid_span
@@ -1767,6 +1865,14 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
             context.scene.tp_grid_span = self.span
         if self.offset != context.scene.tp_grid_offset:
             context.scene.tp_grid_offset = self.offset
+            
+        if self.smooth_factor != context.scene.tp_smooth_factor:
+            orig_in_update = _in_grid_update
+            _in_grid_update = True
+            try:
+                context.scene.tp_smooth_factor = self.smooth_factor
+            finally:
+                _in_grid_update = orig_in_update
 
         topo_obj = context.active_object
         if not topo_obj or topo_obj.type != 'MESH':
@@ -1827,25 +1933,71 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                 # 执行标准单闭合圈填充
                 loop_verts = comp['loop_verts']
                 L = len(loop_verts)
-                best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
-                if not best_params:
-                    self.report({'ERROR'}, "单圈填充失败：无法找到合适的划分方案")
-                    return {'CANCELLED'}
-                    
-                M, N, offset = best_params
                 
-                # 记录最优参数
+                # 检查是否是奇数圈，如果是，则自动细分一条外围边使其成为偶数圈，保证能完美生成四边形网格
+                if L % 2 != 0:
+                    best_edge = None
+                    min_faces = 99999
+                    max_len = -1.0
+                    for e in comp['edges']:
+                        num_faces = len(e.link_faces)
+                        if num_faces < min_faces:
+                            min_faces = num_faces
+                            best_edge = e
+                            max_len = e.calc_length()
+                        elif num_faces == min_faces:
+                            l = e.calc_length()
+                            if l > max_len:
+                                max_len = l
+                                best_edge = e
+                    if best_edge:
+                        res = bmesh.ops.subdivide_edges(bm, edges=[best_edge], cuts=1)
+                        bm.verts.index_update()
+                        bm.edges.index_update()
+                        bm.verts.ensure_lookup_table()
+                        bm.edges.ensure_lookup_table()
+                        
+                        new_verts = [g for g in res['geom_split'] if isinstance(g, bmesh.types.BMVert)]
+                        if new_verts:
+                            new_v = new_verts[0]
+                            comp_edges_set = set(comp['edges'])
+                            comp_edges_set.remove(best_edge)
+                            for ne in new_v.link_edges:
+                                comp_edges_set.add(ne)
+                            comp['edges'] = list(comp_edges_set)
+                            loop_verts = trace_cycle_verts(comp['edges'])
+                            L = len(loop_verts)
+                
+                # 寻找与当前圈相邻的、已填充的栅格区域，获取固定边界约束
+                fixed_boundaries = find_fixed_boundaries_for_loop(bm, loop_verts, comp['edges'], active_cycle_idx=0)
+                has_fixed = len(fixed_boundaries) > 0
+                
+                if has_fixed:
+                    # 如果有相邻已填充栅格，使用全局协调求解器，以保全对齐和缝合
+                    solved_params = solve_global_grid_parameters([loop_verts], [], ref_obj, topo_obj, fixed_boundaries=fixed_boundaries)
+                    if solved_params and solved_params[0]:
+                        M, N, offset = solved_params[0]
+                    else:
+                        self.report({'ERROR'}, "单圈填充失败：无法找到与相邻栅格对齐的划分方案")
+                        return {'CANCELLED'}
+                else:
+                    best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
+                    if not best_params:
+                        self.report({'ERROR'}, "单圈填充失败：无法找到合适的划分方案")
+                        return {'CANCELLED'}
+                    M, N, offset = best_params
+                
+                # 记录最优参数（作为后续微调的参考起点）
                 last_optimal_span = N
                 last_optimal_offset = offset
                 
-                # Apply user span override if specified (span >= 2)
-                if self.span >= 2:
-                    half_L = L // 2
-                    N = max(2, min(half_L - 2, self.span))
-                    M = half_L - N
-                    
-                # Apply user offset override
-                offset = (offset + self.offset) % L
+                # 仅在无相邻栅格约束时，才允许用户通过 slider 强行覆盖参数
+                if not has_fixed:
+                    if self.span >= 2:
+                        half_L = L // 2
+                        N = max(2, min(half_L - 2, self.span))
+                        M = half_L - N
+                    offset = (offset + self.offset) % L
                 
                 grid_coords = init_coons_grid(loop_verts, M, N, offset)
                 
@@ -1923,13 +2075,17 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     last_optimal_span = last_span
                     last_optimal_offset = last_offset
                 
-        # 全局整体调优所有拼接的栅格，确保过渡平滑美观
-        global_optimize_spliced_grids(
-            bm, ref_obj, topo_obj,
-            iterations=self.iterations,
-            smooth_factor=self.smooth_factor,
-            spring_factor=self.spring_factor
-        )
+        # 全局整体调优所有拼接的栅格，确保过渡平滑美观。如果是画完一笔自动触发的填充，则跳过全局整体调优，避免调整已生成的栅格
+        if not self.is_auto:
+            global_optimize_spliced_grids(
+                bm, ref_obj, topo_obj,
+                iterations=self.iterations,
+                smooth_factor=self.smooth_factor,
+                spring_factor=self.spring_factor
+            )
+        
+        # 合并极其接近的重复顶点，确保完美的接缝缝合
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
         
         # 重新计算法线方向，确保显示正常（防止非包裹状态下因法线朝向问题显示为黑色）
         bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
@@ -1939,7 +2095,6 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         
         # 如果是自动栅格填充模式，将计算得出的最优跨分与偏移回填写入场景属性中
         if self.span == 0 and last_optimal_span >= 2:
-            global _in_grid_update
             _in_grid_update = True
             try:
                 context.scene.tp_grid_span = last_optimal_span
@@ -2200,18 +2355,31 @@ def update_last_grid(context):
             
         # Calculate best parameters
         L = len(loop_verts)
-        best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
-        if not best_params:
-            continue
-            
-        M, N, offset = best_params
         
-        if user_span >= 2:
-            half_L = L // 2
-            N = max(2, min(half_L - 2, user_span))
-            M = half_L - N
+        # 寻找与当前被调整圈相邻的、已填充的其它栅格区域，获取固定边界约束
+        fixed_boundaries = find_fixed_boundaries_for_loop(bm, loop_verts, E_boundary, active_cycle_idx=0)
+        has_fixed = len(fixed_boundaries) > 0
+        
+        if has_fixed:
+            # 如果有相邻已填充栅格，使用全局协调求解器，以保全对齐 and 缝合
+            solved_params = solve_global_grid_parameters([loop_verts], [], ref_obj, topo_obj, fixed_boundaries=fixed_boundaries)
+            if solved_params and solved_params[0]:
+                M, N, offset = solved_params[0]
+            else:
+                continue
+        else:
+            best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
+            if not best_params:
+                continue
+            M, N, offset = best_params
             
-        offset = (offset + user_offset) % L
+        # 仅在无相邻栅格约束时，才允许用户通过 slider 强行覆盖参数
+        if not has_fixed:
+            if user_span >= 2:
+                half_L = L // 2
+                N = max(2, min(half_L - 2, user_span))
+                M = half_L - N
+            offset = (offset + user_offset) % L
         
         # Initialize and optimize grid
         grid_coords = init_coons_grid(loop_verts, M, N, offset)
@@ -2220,7 +2388,7 @@ def update_last_grid(context):
             ref_obj=ref_obj,
             topo_obj=topo_obj,
             iterations=40,
-            smooth_factor=0.4,
+            smooth_factor=scene.tp_smooth_factor,
             spring_factor=0.3
         )
         
@@ -2268,7 +2436,7 @@ def update_last_grid(context):
     global_optimize_spliced_grids(
         bm, ref_obj, topo_obj,
         iterations=40,
-        smooth_factor=0.4,
+        smooth_factor=scene.tp_smooth_factor,
         spring_factor=0.3
     )
     
@@ -2297,6 +2465,10 @@ def update_last_grid(context):
     if selected_verts_after:
         bm.select_history.clear()
         bm.select_history.add(selected_verts_after[-1])
+
+    # 合并极其接近的重复顶点，确保完美的接缝缝合
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
 
     # Update edit mesh and viewport
     bmesh.update_edit_mesh(topo_obj.data)
