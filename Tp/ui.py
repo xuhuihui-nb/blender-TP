@@ -90,47 +90,83 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
             row.prop(
                 scene,
                 "tp_show_tutorial",
-                text="使用教程 & 快捷键说明",
+                text="教程 & Tutorial",
                 icon="TRIA_DOWN" if scene.tp_show_tutorial else "TRIA_RIGHT",
                 emboss=False,
                 toggle=True
             )
             
             if scene.tp_show_tutorial:
+                row_lang = box.row(align=True)
+                row_lang.prop(scene, "tp_tutorial_lang", expand=True)
+                
                 col_t = box.column(align=True)
-                
-                col_t.label(text="【起步与退出】", icon='PLAY')
-                col_t.label(text="• 启动拓扑: 选中高模网格 -> 点击【拓扑】按钮")
-                col_t.label(text="• 退出拓扑: 按 ESC 键 或 再次点击【拓扑】按钮")
-                
-                col_t.separator()
-                col_t.label(text="【绘制与生成】", icon='GREASEPENCIL')
-                col_t.label(text="• 连续画线: 按住 Ctrl + 左键拖动")
-                col_t.label(text="• 多段画线: 按住 Ctrl + 左键单击 (回车/Enter提交)")
-                col_t.label(text="• 包围拓扑: Ctrl + 左键从外部拖拽划过网格，自动生成包围闭合圈")
-                col_t.label(text="• 自动合并: 靠近起点或已有顶点时自动吸附并合并")
-                col_t.label(text="• 自动填充: 绘制闭合圈符合栅格要求时，将自动进行栅格填充")
-                col_t.label(text="• 取消绘制: 绘制未提交时，点击鼠标右键取消")
-                col_t.label(text="• 撤销重做: Ctrl + Z 撤销 (多段线时撤销上一个点) / Ctrl + Y 重做")
-                
-                col_t.separator()
-                col_t.label(text="【参数与选项】", icon='PROPERTIES')
-                col_t.label(text="• 目标边长: 调整【边长】控制绘制线段的默认采样密度")
-                col_t.label(text="• 固定点数: 勾选【点的数量】并设数值，将固定顶点数绘制")
-                col_t.label(text="• 最前与包裹: 开启【最前显示】便于观察，【包裹】使点自动贴合高模")
-                col_t.label(text="• 锁定边界: 开启【固定】可锁定边界顶点；若选点则仅锁定选中点")
-                
-                col_t.separator()
-                col_t.label(text="【编辑与调整】", icon='GRIP')
-                col_t.label(text="• 循环边选择: Alt + 左键点击顶点/边 (多次点击可切换候选路径)")
-                col_t.label(text="• 顶点微调: 点附近按 G 键直接移动，或选中后按 G 键 (右键/ESC取消)")
-                col_t.label(text="• 循环细分: 选中边/圈或已填栅格，Ctrl + 滚轮可实时调整密度")
-                
-                col_t.separator()
-                col_t.label(text="【栅格填充微调】", icon='GRID')
-                col_t.label(text="• 手动填充: Alt + 左键选中边界线圈 -> 点击【栅格填充】")
-                col_t.label(text="• 实时微调: 修改【跨分】与【偏移】可实时微调选中的已填充栅格")
-                col_t.label(text="• 移除栅格: 选中已填充栅格或不选任何元素，点击【移除栅格】")
+                if scene.tp_tutorial_lang == 'ZH':
+                    col_t.label(text="【起步与退出】", icon='PLAY')
+                    col_t.label(text="• 启动拓扑: 选中高模网格 -> 点击【拓扑】按钮")
+                    col_t.label(text="• 退出拓扑: 按 ESC 键 或 再次点击【拓扑】按钮")
+                    
+                    col_t.separator()
+                    col_t.label(text="【绘制与生成】", icon='GREASEPENCIL')
+                    col_t.label(text="• 连续画线: 按住 Ctrl + 左键拖动")
+                    col_t.label(text="• 多段画线: 按住 Ctrl + 左键单击 (回车/Enter提交)")
+                    col_t.label(text="• 包围拓扑: Ctrl + 左键从外部拖拽划过网格，自动生成包围闭合圈")
+                    col_t.label(text="• 自动合并: 靠近起点或已有顶点时自动吸附并合并")
+                    col_t.label(text="• 自动填充: 绘制闭合圈符合栅格要求时，将自动进行栅格填充")
+                    col_t.label(text="• 取消绘制: 绘制未提交时，点击鼠标右键取消")
+                    col_t.label(text="• 撤销重做: Ctrl + Z 撤销 (多段线时撤销上一个点) / Ctrl + Y 重做")
+                    
+                    col_t.separator()
+                    col_t.label(text="【参数与选项】", icon='PROPERTIES')
+                    col_t.label(text="• 目标边长: 调整【边长】控制绘制线段的默认采样密度")
+                    col_t.label(text="• 固定点数: 勾选【点的数量】并设数值，将固定顶点数绘制")
+                    col_t.label(text="• 最前与包裹: 开启【最前显示】便于观察，【包裹】使点自动贴合高模")
+                    col_t.label(text="• 锁定边界: 开启【固定】可锁定边界顶点；若选点则仅锁定选中点")
+                    
+                    col_t.separator()
+                    col_t.label(text="【编辑与调整】", icon='GRIP')
+                    col_t.label(text="• 循环边选择: Alt + 左键点击顶点/边 (多次点击可切换候选路径)")
+                    col_t.label(text="• 顶点微调: 点附近按 G 键直接移动，或选中后按 G 键 (右键/ESC取消)")
+                    col_t.label(text="• 循环细分: 选中边/圈或已填栅格，Ctrl + 滚轮可实时调整密度")
+                    
+                    col_t.separator()
+                    col_t.label(text="【栅格填充微调】", icon='GRID')
+                    col_t.label(text="• 手动填充: Alt + 左键选中边界线圈 -> 点击【栅格填充】")
+                    col_t.label(text="• 实时微调: 修改【跨分】与【偏移】可实时微调选中的已填充栅格")
+                    col_t.label(text="• 移除栅格: 选中已填充栅格或不选任何元素，点击【移除栅格】")
+                else:
+                    col_t.label(text="【Start & Exit】", icon='PLAY')
+                    col_t.label(text="• Start Topology: Select high-poly mesh -> Click [Topology] button")
+                    col_t.label(text="• Exit Topology: Press ESC or click [Topology] button again")
+                    
+                    col_t.separator()
+                    col_t.label(text="【Draw & Generate】", icon='GREASEPENCIL')
+                    col_t.label(text="• Continuous Draw: Hold Ctrl + drag LMB (Left Mouse Button)")
+                    col_t.label(text="• Polyline Draw: Hold Ctrl + click LMB (Press Enter to submit)")
+                    col_t.label(text="• Envelope Topology: Hold Ctrl + drag LMB from outside across mesh to auto-generate a closed loop")
+                    col_t.label(text="• Auto Merge: Snaps and merges automatically when close to start point or existing vertices")
+                    col_t.label(text="• Auto Fill: Automatically grid-fills when drawing a closed loop that meets grid requirements")
+                    col_t.label(text="• Cancel Drawing: Click RMB (Right Mouse Button) to cancel before submitting")
+                    col_t.label(text="• Undo/Redo: Ctrl + Z to undo (undos the last point for polylines) / Ctrl + Y to redo")
+                    
+                    col_t.separator()
+                    col_t.label(text="【Parameters & Options】", icon='PROPERTIES')
+                    col_t.label(text="• Target Edge Length: Adjust [Edge Length] to control default sampling density of drawn strokes")
+                    col_t.label(text="• Fixed Point Count: Enable [Number of Points] and set value to draw with fixed vertices")
+                    col_t.label(text="• In Front & Wrap: Enable [In Front] for visibility, [Wrap] to automatically snap vertices to the high-poly surface")
+                    col_t.label(text="• Lock Boundary: Enable [Pin] to lock boundary vertices; if vertices are selected, only locks selected vertices")
+                    
+                    col_t.separator()
+                    col_t.label(text="【Edit & Adjust】", icon='GRIP')
+                    col_t.label(text="• Edge Loop Select: Alt + click LMB on vertex/edge (click repeatedly to cycle through candidate paths)")
+                    col_t.label(text="• Tweak Vertex: Press G near a vertex to move it directly, or press G after selecting (RMB/ESC to cancel)")
+                    col_t.label(text="• Loop Subdivide: Select edge/loop/grid, Ctrl + Scroll Wheel to adjust density in real-time")
+                    
+                    col_t.separator()
+                    col_t.label(text="【Grid Fill Adjustment】", icon='GRID')
+                    col_t.label(text="• Manual Fill: Alt + click LMB to select a boundary loop -> Click [Grid Fill]")
+                    col_t.label(text="• Real-time Tweak: Adjust [Span] and [Offset] to tweak the selected grid fill in real-time")
+                    col_t.label(text="• Remove Grid: Select a grid fill or nothing, then click [Remove Grid]")
         else:
             if not is_mesh:
                 col.label(text="请选择一个网格对象开始拓扑", icon='INFO')

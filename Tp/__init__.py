@@ -94,8 +94,16 @@ def register():
     )
     bpy.types.Scene.tp_show_tutorial = bpy.props.BoolProperty(
         name="显示教程",
-        description="展开/折叠使用教程与快捷键说明",
+        description="展开/折叠 教程 & Tutorial",
         default=False
+    )
+    bpy.types.Scene.tp_tutorial_lang = bpy.props.EnumProperty(
+        items=[
+            ('ZH', "中文教程", "显示中文使用教程"),
+            ('EN', "English Tutorial", "Show English tutorial instructions")
+        ],
+        name="教程语言",
+        default='ZH'
     )
     # Register depsgraph update handler
     bpy.app.handlers.depsgraph_update_post.append(op_draw.tp_pin_depsgraph_handler)
@@ -113,6 +121,7 @@ def unregister():
     del bpy.types.Scene.tp_grid_span
     del bpy.types.Scene.tp_grid_offset
     del bpy.types.Scene.tp_show_tutorial
+    del bpy.types.Scene.tp_tutorial_lang
     # Unregister depsgraph update handler
     if op_draw.tp_pin_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(op_draw.tp_pin_depsgraph_handler)
