@@ -61,7 +61,8 @@ def register():
         min=0.0,
         max=1.0,
         precision=2,
-        step=5.0
+        step=5.0,
+        update=op_grid_fill.on_grid_settings_update
     )
     bpy.types.Scene.tp_use_wrap = bpy.props.BoolProperty(
         name="包裹",
@@ -87,7 +88,11 @@ def register():
         default=0,
         update=op_grid_fill.on_grid_settings_update
     )
-    
+    bpy.types.Scene.tp_show_tutorial = bpy.props.BoolProperty(
+        name="显示教程",
+        description="展开/折叠使用教程与快捷键说明",
+        default=False
+    )
     # Register depsgraph update handler
     bpy.app.handlers.depsgraph_update_post.append(op_draw.tp_pin_depsgraph_handler)
 
@@ -102,7 +107,7 @@ def unregister():
     del bpy.types.Scene.tp_pin_boundary
     del bpy.types.Scene.tp_grid_span
     del bpy.types.Scene.tp_grid_offset
-    
+    del bpy.types.Scene.tp_show_tutorial
     # Unregister depsgraph update handler
     if op_draw.tp_pin_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(op_draw.tp_pin_depsgraph_handler)

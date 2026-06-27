@@ -1936,6 +1936,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     if edge.is_valid:
                         edge[no_auto_layer] = 1
                 
+            bm.verts.index_update()
             curr_indices = [v.index for v in bm_verts if v is not None]
             bmesh.update_edit_mesh(topo_obj.data)
         else:
@@ -1977,6 +1978,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     if edge.is_valid:
                         edge[no_auto_layer] = 1
                 
+            bm.verts.index_update()
             curr_indices = [v.index for v in bm_verts if v is not None]
             bm.to_mesh(topo_obj.data)
             bm.free()
@@ -2058,16 +2060,26 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             orig_sel_edges = [e.index for e in bm.edges if e.select]
             orig_sel_faces = [f.index for f in bm.faces if f.select]
             
-            # Select all vertices of the newly created stroke to check if they form/part of a closed loop
+            # Select all vertices and edges of the newly created stroke to check if they form/part of a closed loop
             for v in bm.verts:
                 v.select = (v.index in curr_indices)
             for e in bm.edges:
-                e.select = False
-            for f in bm.faces:
-                f.select = False
-            
+                e.select = (e.verts[0].index in curr_indices and e.verts[1].index in curr_indices)
+            try:
+                with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                    f_log.write(f"  [op_draw select] curr_indices: {curr_indices}\n")
+                    f_log.write(f"  [op_draw select] selected in bm: {[v.index for v in bm.verts if v.select]}\n")
+            except:
+                pass
             # Analyze selection to see if it contains a valid unfilled closed loop
             components, err_msg = analyze_selection(bm, is_auto=True)
+            try:
+                with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                    f_log.write(f"\n--- op_draw check: analyze_selection returned {len(components)} components, err_msg={err_msg} ---\n")
+                    for c_idx, c in enumerate(components):
+                        f_log.write(f"  Comp {c_idx}: type={c['type']}, verts={len(c['vert_indices'])}, is_grid_filled={c['is_grid_filled']}\n")
+            except:
+                pass
             
             has_valid_unfilled_loop = False
             if components and not err_msg:
@@ -2085,6 +2097,13 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 try:
                     bpy.ops.object.tp_topology_grid_fill(is_auto=True)
                 except Exception as e:
+                    import traceback
+                    tb_str = traceback.format_exc()
+                    try:
+                        with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_err:
+                            f_err.write("--- Auto grid fill error ---\n" + tb_str + "\n")
+                    except:
+                        pass
                     print("Auto grid fill error:", e)
                 
                 # After grid fill, restore to only selecting the last vertex of the stroke if it exists and is valid
@@ -3068,12 +3087,6 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         for f in bm.faces:
             f.select = False
             
-        for loop_info in created_loops:
-            vert_indices = loop_info['vert_indices']
-            for idx in vert_indices:
-                if idx < len(bm.verts):
-                    bm.verts[idx].select = True
-                    
         bmesh.update_edit_mesh(topo_obj.data)
         self.rebuild_kd_tree()
         
