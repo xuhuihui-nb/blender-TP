@@ -7,24 +7,103 @@ import math
 def check_is_grid_filled(bm, loop_verts, cycle_edges):
     """
     检查一个圈（顶点和边）是否已经完成了栅格填充。
-    如果圈中超过 80% 的边连接了已栅格化（f[grid_layer] > 0）的面，则判定为已填充。
+    算法：
+    1. 获取这个圈的所有边连接的所有已填充的面（f[grid_layer] > 0）。
+    2. 使用 BFS 找出与这些面相连的所有已栅格化面片（允许跨越不同的 loop_id）。
+    3. 计算该整体连通面片的边界边集合。
+    4. 如果该边界边集合与当前圈的边集合高度重合（双向重合率均 > 80%），则判定当前圈已被填充。
     """
     grid_layer = bm.faces.layers.int.get("tp_is_grid")
     if not grid_layer:
         return False
         
-    cycle_edges_set = set(cycle_edges)
+    cycle_edges_set = {e for e in cycle_edges if e.is_valid}
     if not cycle_edges_set:
         return False
         
-    grid_edge_count = 0
+    # 找出所有与当前圈直接相邻且已填充的面
+    start_faces = set()
     for e in cycle_edges_set:
-        # 检查这条边是否连接了任何已栅格化的面
-        if any(f[grid_layer] > 0 for f in e.link_faces):
-            grid_edge_count += 1
+        for f in e.link_faces:
+            if f.is_valid and f[grid_layer] > 0:
+                start_faces.add(f)
+                
+    if not start_faces:
+        return False
+        
+    # BFS 寻找所有连通的已填充面（允许跨越不同的 loop_id，以识别已拼接的整体区域）
+    filled_faces = set(start_faces)
+    queue = list(start_faces)
+    while queue:
+        curr_f = queue.pop()
+        for edge in curr_f.edges:
+            for nbr_f in edge.link_faces:
+                if nbr_f.is_valid and nbr_f not in filled_faces and nbr_f[grid_layer] > 0:
+                    filled_faces.add(nbr_f)
+                    queue.append(nbr_f)
+                    
+    # 收集该连通面区域的所有边
+    filled_edges = set()
+    for f in filled_faces:
+        filled_edges.update(f.edges)
+        
+    # 计算该连通区域的边界边（在此分区中仅与一个面相连的边）
+    filled_boundary_edges = {
+        e for e in filled_edges
+        if e.is_valid and sum(1 for f in e.link_faces if f in filled_faces) == 1
+    }
+    
+    # 进行双向比例校验，确保该空洞或已填充圈与栅格边界能完美匹配
+    intersection = cycle_edges_set.intersection(filled_boundary_edges)
+    if len(cycle_edges_set) > 0:
+        ratio_loop = len(intersection) / len(cycle_edges_set)
+        
+        # 情况 A: 标准网格边界匹配
+        if len(filled_boundary_edges) > 0:
+            ratio_grid = len(intersection) / len(filled_boundary_edges)
+            if ratio_loop > 0.8 and ratio_grid > 0.8:
+                return True
+                
+        # 情况 B: 环形多孔网格的外围大边界（例如包围 A 圈的外围整体边界）
+        # 此时 ratio_grid 因为包含内圈孔洞边界而偏低，但 ratio_loop 依然很高。
+        # 我们通过比较“圈所围成的面积”与“连通面片的总面积”来判定：
+        # 如果 loop_area > 0.8 * total_face_area，说明该圈是包围已填充区域的外围大圈；
+        # 如果是内圈孔洞，其面积会明显小于连通面片的总面积，从而被正确判定为未填充。
+        if ratio_loop > 0.8:
+            # 计算 Loop 质心
+            centroid = sum((v.co for v in loop_verts), Vector((0,0,0))) / len(loop_verts)
+            # 计算 Loop 的平均法线
+            normal = Vector((0,0,0))
+            n = len(loop_verts)
+            for i in range(n):
+                v1 = loop_verts[i].co - centroid
+                v2 = loop_verts[(i+1)%n].co - centroid
+                normal += v1.cross(v2)
+            normal.normalize()
             
-    ratio = grid_edge_count / len(cycle_edges_set)
-    return ratio > 0.8
+            # 构建投影平面正交基
+            if abs(normal.x) < 0.9:
+                ref = Vector((1, 0, 0))
+            else:
+                ref = Vector((0, 1, 0))
+            T = normal.cross(ref).normalized()
+            B = normal.cross(T).normalized()
+            
+            # 计算 Loop 的 2D 投影面积（鞋带公式）
+            loop_area = 0.0
+            for i in range(n):
+                x1, y1 = loop_verts[i].co.dot(T), loop_verts[i].co.dot(B)
+                x2, y2 = loop_verts[(i+1)%n].co.dot(T), loop_verts[(i+1)%n].co.dot(B)
+                loop_area += (x1 * y2 - x2 * y1)
+            loop_area = abs(loop_area) * 0.5
+            
+            # 计算连通面片的总 3D 面积
+            total_face_area = sum(f.calc_area() for f in filled_faces)
+            
+            if loop_area > 0.8 * total_face_area:
+                return True
+            
+    return False
 
 
 def analyze_selection(bm, is_auto=False):
@@ -222,6 +301,11 @@ def analyze_selection(bm, is_auto=False):
                     filtered_components.append(c)
                     continue
                 c_edges = c.get('edges', [])
+                # 如果是自动绘制完成触发的检测(is_auto=True)，且该圈包含了当前新绘制的边，
+                # 说明这是在 A 圈上新建/绘制的拼接圈，应该允许其进行自动栅格填充
+                if is_auto and c_edges and any(e in selected_edges for e in c_edges):
+                    filtered_components.append(c)
+                    continue
                 if c_edges:
                     marked_count = sum(1 for e in c_edges if e.is_valid and e[no_auto_layer] == 1)
                     if (marked_count / len(c_edges)) > 0.5:
@@ -860,7 +944,7 @@ def compute_vertex_normal_from_curr_cos(v, F, curr_cos):
     return v.normal.normalized()
 
 
-def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_factor=0.3):
+def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_factor=0.3, allowed_loop_ids=None):
     """
     对网格中所有已填充的拼接栅格区域进行全局拓扑优化（整体调优）。
     保持最外层边界点不动，释放所有内部顶点以及不同栅格区域之间的共享边界顶点，
@@ -871,6 +955,9 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_f
     grid_layer = bm.faces.layers.int.get("tp_is_grid")
     if not grid_layer:
         return
+        
+    if allowed_loop_ids is not None:
+        allowed_loop_ids = set(allowed_loop_ids)
         
     grid_faces = [f for f in bm.faces if f[grid_layer] > 0]
     if not grid_faces:
@@ -928,6 +1015,13 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_f
         pin_layer = bm.verts.layers.int.get("tp_is_pinned")
         if pin_layer:
             boundary_verts.update({v for v in V if v[pin_layer] == 1})
+            
+        # 如果指定了允许优化的 loop_ids，把其他非允许 loop 中的顶点全部加入固定顶点，绝对不动
+        if allowed_loop_ids is not None:
+            for lid in loop_ids:
+                if lid not in allowed_loop_ids:
+                    F_lid = {f for f in F if f[grid_layer] == lid}
+                    boundary_verts.update({v for f in F_lid for v in f.verts})
             
         # 内部顶点可以自由移动
         interior_verts = V - boundary_verts
@@ -1025,17 +1119,27 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_f
                         hit_normal = None
                         is_raycast = False
                         
-                        dist_f = (loc_f - local_origin).length if success_f else float('inf')
-                        dist_b = (loc_b - local_origin).length if success_b else float('inf')
-                        
-                        if dist_f < dist_b and dist_f < max_ray_dist:
-                            hit_pos = loc_f
-                            hit_normal = norm_f
-                            is_raycast = True
-                        elif dist_b < max_ray_dist:
-                            hit_pos = loc_b
-                            hit_normal = norm_b
-                            is_raycast = True
+                        if success_f or success_b:
+                            dist_f_topo = float('inf')
+                            dist_b_topo = float('inf')
+                            
+                            if success_f:
+                                topo_pos_f = topo_inverse @ (matrix_world_ref @ loc_f)
+                                dist_f_topo = (topo_pos_f - curr_cos[v]).length
+                            if success_b:
+                                topo_pos_b = topo_inverse @ (matrix_world_ref @ loc_b)
+                                dist_b_topo = (topo_pos_b - curr_cos[v]).length
+                                
+                            if dist_f_topo < dist_b_topo:
+                                if dist_f_topo < max_ray_dist:
+                                    hit_pos = loc_f
+                                    hit_normal = norm_f
+                                    is_raycast = True
+                            else:
+                                if dist_b_topo < max_ray_dist:
+                                    hit_pos = loc_b
+                                    hit_normal = norm_b
+                                    is_raycast = True
                             
                         if hit_pos is None:
                             # 备用方案：高模表面最近点
@@ -1060,7 +1164,7 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_f
                                 local_pt = location_snap + normal_snap * 0.003
                                 projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
                                 
-                                if is_raycast or (projected_pos - relaxed_pos).length < 2.0 * avg_boundary_len:
+                                if is_raycast or (projected_pos - relaxed_pos).length < max_ray_dist:
                                     relaxed_pos = projected_pos
                     except Exception:
                         pass
@@ -1102,7 +1206,7 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_f
                 v.co = relaxed_pos
 
 
-def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor, selected_verts=None, selected_edges=None, user_span=0, user_offset=0):
+def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor, selected_verts=None, selected_edges=None, user_span=0, user_offset=0, is_auto=False):
     """
     对非线性拼接圈进行多区域栅格填充，全局协调各子圈的划分参数以达到上下承接效果
     """
@@ -1116,6 +1220,25 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor
         return 0
     cycles = [set(c) for c in raw_cycles]
     
+    no_auto_layer = bm.edges.layers.int.get("tp_no_auto_fill")
+    
+    def should_fill_cycle(cycle_edges, loop_verts):
+        # 1. 检查选择集交集（如果有选择集的话）
+        if selected_verts or selected_edges:
+            has_intersect = any(v in selected_verts for v in loop_verts) or \
+                            any(e in selected_edges for e in cycle_edges)
+            if not has_intersect:
+                return False
+                
+        # 2. 如果是自动栅格填充，且该圈被标记为不自动填充，且不包含当前新绘制的边，则不填充
+        if is_auto and no_auto_layer:
+            has_new_edges = any(e in selected_edges for e in cycle_edges) if selected_edges else False
+            if not has_new_edges:
+                marked_count = sum(1 for e in cycle_edges if e.is_valid and e[no_auto_layer] == 1)
+                if len(cycle_edges) > 0 and (marked_count / len(cycle_edges)) > 0.5:
+                    return False
+        return True
+    
     # 2. 为奇数顶点圈进行边缘细分，确保所有子圈的顶点数均为偶数，以便全局协调划分
     for cycle_idx in range(len(cycles)):
         cycle_edges = cycles[cycle_idx]
@@ -1124,11 +1247,8 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor
         if check_is_grid_filled(bm, loop_verts, cycle_edges):
             continue
             
-        if selected_verts or selected_edges:
-            has_intersect = any(v in selected_verts for v in loop_verts) or \
-                            any(e in selected_edges for e in cycle_edges)
-            if not has_intersect:
-                continue
+        if not should_fill_cycle(cycle_edges, loop_verts):
+            continue
                 
         if len(loop_verts) % 2 != 0:
             edge_counts = {}
@@ -1190,11 +1310,8 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor
         if check_is_grid_filled(bm, loop_verts, cycle_edges):
             continue
             
-        if selected_verts or selected_edges:
-            has_intersect = any(v in selected_verts for v in loop_verts) or \
-                            any(e in selected_edges for e in cycle_edges)
-            if not has_intersect:
-                continue
+        if not should_fill_cycle(cycle_edges, loop_verts):
+            continue
                 
         active_indices.append(idx)
         cycles_verts[idx] = loop_verts
@@ -1825,7 +1942,7 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                 relaxed_pos = pos.lerp(pos_lap, smooth_factor).lerp(pos_spring, spring_factor)
                 
                 # C. 渐进式拓扑拉力控制（Barycentric Restorative Pull）
-                # 放在投影之前，使其作为一种松弛力，通过投影贴合到表面上，防止拉力导致顶点下陷到模型内部
+                # 限制在切平面内，并减小权重，以允许三维弹簧力维持表面均匀间距，防止起伏表面处的拉伸变形
                 B = grid_coords[u][0]
                 T = grid_coords[u][N]
                 col_vec = T - B
@@ -1837,9 +1954,11 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                     t = t_val / col_len
                     y_target = v / N
                     
-                    # 浠呭湪绾靛悜涓婂線鐞嗘兂鎷撴墤楂樺害寰皟锛岄槻姝㈣閲嶅彔
-                    t_new = t + 0.15 * (y_target - t)
-                    relaxed_pos = relaxed_pos + ((t_new - t) * col_len) * col_dir
+                    # 仅在纵向高度上微调，权重降至 0.03 并投影到切平面
+                    t_new = t + 0.03 * (y_target - t)
+                    corr_y = ((t_new - t) * col_len) * col_dir
+                    corr_y_tangent = corr_y - corr_y.dot(grid_normal) * grid_normal
+                    relaxed_pos = relaxed_pos + corr_y_tangent
                         
                 L_bound = grid_coords[0][v]
                 R_bound = grid_coords[M][v]
@@ -1852,9 +1971,11 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                     s = s_val / row_len
                     x_target = u / M
                     
-                    # 浠呭湪妯悜涓婂線鐞嗘兂鎷撴墤瀹藉害寰皟锛岄槻姝㈠垪閲嶅彔
-                    s_new = s + 0.15 * (x_target - s)
-                    relaxed_pos = relaxed_pos + ((s_new - s) * row_len) * row_dir
+                    # 仅在横向宽度上微调，权重降至 0.03 并投影到切平面
+                    s_new = s + 0.03 * (x_target - s)
+                    corr_x = ((s_new - s) * row_len) * row_dir
+                    corr_x_tangent = corr_x - corr_x.dot(grid_normal) * grid_normal
+                    relaxed_pos = relaxed_pos + corr_x_tangent
 
                 # D. 璐村悎楂樻ā琛ㄩ潰锛堜娇鐢ㄥ弻鍚戝皠绾挎姇褰?+ 澶囩敤鏈€杩戠偣鎶曞奖锛?                if should_project:
                     try:
@@ -1874,18 +1995,27 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                         hit_normal = None
                         is_raycast = False
                         
-                        dist_f = (loc_f - local_origin).length if success_f else float('inf')
-                        dist_b = (loc_b - local_origin).length if success_b else float('inf')
-                        
-                        # 优先选择距离较近且在合理范围内的交点
-                        if dist_f < dist_b and dist_f < max_ray_dist:
-                            hit_pos = loc_f
-                            hit_normal = norm_f
-                            is_raycast = True
-                        elif dist_b < max_ray_dist:
-                            hit_pos = loc_b
-                            hit_normal = norm_b
-                            is_raycast = True
+                        if success_f or success_b:
+                            dist_f_topo = float('inf')
+                            dist_b_topo = float('inf')
+                            
+                            if success_f:
+                                topo_pos_f = topo_inverse @ (matrix_world_ref @ loc_f)
+                                dist_f_topo = (topo_pos_f - pos).length
+                            if success_b:
+                                topo_pos_b = topo_inverse @ (matrix_world_ref @ loc_b)
+                                dist_b_topo = (topo_pos_b - pos).length
+                                
+                            if dist_f_topo < dist_b_topo:
+                                if dist_f_topo < max_ray_dist:
+                                    hit_pos = loc_f
+                                    hit_normal = norm_f
+                                    is_raycast = True
+                            else:
+                                if dist_b_topo < max_ray_dist:
+                                    hit_pos = loc_b
+                                    hit_normal = norm_b
+                                    is_raycast = True
                             
                         if hit_pos is None:
                             # 备用方案：寻找高模表面最近点
@@ -1912,7 +2042,7 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                                 projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
                                 
                                 # 如果是通过射线投射找到的，直接采纳；如果是备用最近点，保留距离安全限制
-                                if is_raycast or (projected_pos - relaxed_pos).length < 2.0 * avg_boundary_len:
+                                if is_raycast or (projected_pos - relaxed_pos).length < max_ray_dist:
                                     relaxed_pos = projected_pos
                     except Exception:
                         pass
@@ -2057,6 +2187,12 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
             if ref_obj_name:
                 ref_obj = bpy.data.objects.get(ref_obj_name)
                 
+        # 记录已有的 grid loop IDs
+        existing_lids = set()
+        grid_layer = bm.faces.layers.int.get("tp_is_grid")
+        if grid_layer:
+            existing_lids = {f[grid_layer] for f in bm.faces if f[grid_layer] > 0}
+
         # 填充各个连通分支
         loops_filled = 0
         joined_filled = 0
@@ -2205,7 +2341,8 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     selected_verts=selected_verts_extended,
                     selected_edges=selected_edges_extended,
                     user_span=self.span,
-                    user_offset=self.offset
+                    user_offset=self.offset,
+                    is_auto=self.is_auto
                 )
                 joined_filled += 1
                 total_faces += faces_created
@@ -2215,10 +2352,15 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                 
         # 全局整体调优所有拼接的栅格，确保过渡平滑美观。如果是画完一笔自动触发的填充，则跳过全局整体调优，避免调整已生成的栅格
         if not self.is_auto:
+            grid_layer = bm.faces.layers.int.get("tp_is_grid")
+            new_loop_ids = set()
+            if grid_layer:
+                new_loop_ids = {f[grid_layer] for f in bm.faces if f[grid_layer] > 0} - existing_lids
             global_optimize_spliced_grids(
                 bm, ref_obj, topo_obj,
                 iterations=self.iterations,
-                spring_factor=self.spring_factor
+                spring_factor=self.spring_factor,
+                allowed_loop_ids=new_loop_ids
             )
         
         # 合并极其接近的重复顶点，确保完美的接缝缝合
@@ -2328,6 +2470,7 @@ class OBJECT_OT_tp_topology_remove_grid(bpy.types.Operator):
         edges_to_delete = []
         verts_to_delete = []
         
+        no_auto_layer = bm.edges.layers.int.get("tp_no_auto_fill") or bm.edges.layers.int.new("tp_no_auto_fill")
         for lid in IDs_del:
             F_loop = [f for f in bm.faces if f[grid_layer] == lid]
             if not F_loop:
@@ -2341,6 +2484,12 @@ class OBJECT_OT_tp_topology_remove_grid(bpy.types.Operator):
             # 独立计算该 loop_id 区域的边界边 and 边界点
             # 边界边是仅与该 loop_id 中的一个面相连的边
             E_boundary = {e for e in E_loop_all if len([f for f in e.link_faces if f[grid_layer] == lid]) == 1}
+            
+            # 将边界边标记为不参与自动栅格填充
+            for e in E_boundary:
+                if e.is_valid:
+                    e[no_auto_layer] = 1
+                    
             V_boundary = {v for e in E_boundary for v in e.verts}
             
             E_internal = E_loop_all - E_boundary
@@ -2619,7 +2768,8 @@ def update_last_grid(context):
     global_optimize_spliced_grids(
         bm, ref_obj, topo_obj,
         iterations=40,
-        spring_factor=0.3
+        spring_factor=0.3,
+        allowed_loop_ids=active_lids
     )
     
     # === 物理记忆与投影追踪恢复 ===
