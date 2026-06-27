@@ -1875,6 +1875,33 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
         total_area += p_curr.cross(p_next).dot(normal_dir)
     if total_area < 0:
         boundary_loop.reverse()
+
+    # Bug4修复：预计算每条边界段的「朝内」方向
+    # 使用网格中心与边界边段中点的连线方向，确保在三维曲面上朝内方向始终正确
+    grid_center = Vector((0.0, 0.0, 0.0))
+    count_pts = 0
+    for u in range(M + 1):
+        for v in range(N + 1):
+            grid_center += grid_coords[u][v]
+            count_pts += 1
+    if count_pts > 0:
+        grid_center /= count_pts
+    boundary_inwards_precomp = []
+    for idx in range(len(boundary_loop)):
+        p_curr = boundary_loop[idx]
+        p_next = boundary_loop[(idx + 1) % len(boundary_loop)]
+        mid = (p_curr + p_next) / 2.0
+        inward = grid_center - mid
+        AB = p_next - p_curr
+        ab_len_sq = AB.length_squared
+        if ab_len_sq > 1e-12:
+            # 去掉沿边方向的分量，只保留垂直于边的朝内分量
+            edge_dir = AB / (ab_len_sq ** 0.5)
+            inward = inward - inward.dot(edge_dir) * edge_dir
+        if inward.length > 1e-6:
+            boundary_inwards_precomp.append(inward.normalized())
+        else:
+            boundary_inwards_precomp.append(normal_dir.copy())
     
     # 2. 准备高模空间变换矩阵
     if ref_obj and topo_obj:
@@ -1979,17 +2006,17 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                 relaxed_pos = pos.lerp(pos_lap, smooth_factor).lerp(pos_spring, spring_factor)
                 
                 # C. Barycentric Restorative Pull using initial Coons Patch coordinates
-                pull_weight = 0.03 if should_project else 0.25
+                # Bug3修复：提高投影阶段的拉回权重（0.03→0.08），避免内部顶点在表面高曲率处漂移；
+                # 同时移除错误的法线切向过滤——在弯曲表面上切掉法线分量反而会把点拉离表面。
+                pull_weight = 0.08 if should_project else 0.25
                 target_pos = initial_coords[u][v]
                 pull = target_pos - relaxed_pos
-                if should_project:
-                    pull = pull - pull.dot(grid_normal) * grid_normal
                 relaxed_pos = relaxed_pos + pull_weight * pull
 
-                # D. 璐村悎楂樻ā琛ㄩ潰锛堜娇鐢ㄥ弻鍚戝皠绾挎姇褰?+ 澶囩敤鏈€杩戠偣鎶曞奖锛塦r`n
+                # D. 贴合高模表面（使用双向射线投影 + 备用最近点贴合投影）
                 if should_project:
                     try:
-                        # 杞崲褰撳墠浣嶇疆鍒伴珮妯＄┖闂达紝鑾峰彇鎶曞奖灏勭嚎璧风偣涓庢柟鍚?                        world_pos = topo_world @ pos
+                        world_pos = topo_world @ relaxed_pos  # Bug1: use relaxed_pos not old pos
                         world_normal = (topo_world.to_3x3() @ grid_normal).normalized()
                         
                         local_origin = matrix_inverse_ref @ world_pos
@@ -2011,10 +2038,10 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                             
                             if success_f:
                                 topo_pos_f = topo_inverse @ (matrix_world_ref @ loc_f)
-                                dist_f_topo = (topo_pos_f - pos).length
+                                dist_f_topo = (topo_pos_f - relaxed_pos).length
                             if success_b:
                                 topo_pos_b = topo_inverse @ (matrix_world_ref @ loc_b)
-                                dist_b_topo = (topo_pos_b - pos).length
+                                dist_b_topo = (topo_pos_b - relaxed_pos).length
                                 
                             if dist_f_topo < dist_b_topo:
                                 if dist_f_topo < max_ray_dist:
@@ -2035,31 +2062,19 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                                 hit_normal = norm_cp
                                 
                         if hit_pos is not None and hit_normal is not None:
-                            normal_world = (matrix_world_ref.to_3x3() @ hit_normal).normalized()
-                            world_hit_pos = matrix_world_ref @ hit_pos
+                            # 直接将命中点吸附到表面（偏移微小法线距离避免z-fighting）并转到topo空间
+                            local_pt = hit_pos + hit_normal * 0.003
+                            projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
                             
-                            # 切向松弛投影
-                            world_relaxed = topo_world @ relaxed_pos
-                            disp = world_relaxed - world_hit_pos
-                            disp_tangent = disp - disp.dot(normal_world) * normal_world
-                            world_relaxed_tangent = world_hit_pos + disp_tangent
-                            
-                            local_target_tangent = matrix_inverse_ref @ world_relaxed_tangent
-                            success_snap, location_snap, normal_snap, index_snap = ref_obj.closest_point_on_mesh(local_target_tangent)
-                            
-                            if success_snap:
-                                local_pt = location_snap + normal_snap * 0.003
-                                projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
-                                
-                                # 如果是通过射线投射找到的，直接采纳；如果是备用最近点，保留距离安全限制
-                                if is_raycast or (projected_pos - relaxed_pos).length < max_ray_dist:
-                                    relaxed_pos = projected_pos
+                            # 如果是通过射线投射找到的，直接采纳；如果是备用最近点，保留距离安全限制
+                            if is_raycast or (projected_pos - relaxed_pos).length < max_ray_dist:
+                                relaxed_pos = projected_pos
                     except Exception:
                         pass
 
                 # E. 物理边界碰撞与安全守护 (Boundary Collision Guard)
-                # 使用局部网格法线 grid_normal 代替全局法线 normal_dir，确保在陡峭表面上 inward 方向始终指向网格内部。
-                # 设定防穿透物理厚度保护（自适应局部边长，防止在狭窄区域过度排斥导致网格折叠与畸变）。
+                # Bug4修复：使用预计算的面质心朝内方向（boundary_inwards_precomp），
+                # 而非每次用 grid_normal 叉积边切线临时计算——后者在三维曲面上可能方向翻转。
                 min_dist_sq = float('inf')
                 best_proj = None
                 best_inward = None
@@ -2082,16 +2097,16 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                     if dist_sq < min_dist_sq:
                         min_dist_sq = dist_sq
                         best_proj = proj
-                        edge_dir = AB.normalized() if ab_len_sq > 1e-12 else Vector((1.0, 0.0, 0.0))
-                        best_inward = grid_normal.cross(edge_dir).normalized()
+                        best_inward = boundary_inwards_precomp[idx]
                         best_ab_len = math.sqrt(ab_len_sq)
                         
                 # 设定防穿透自适应局部物理厚度保护
-                local_margin = 0.15 * min(avg_boundary_len, best_ab_len)
-                V_collision = relaxed_pos - best_proj
-                dot_collision = V_collision.dot(best_inward)
-                if dot_collision < local_margin:
-                    relaxed_pos = best_proj + best_inward * local_margin
+                if best_proj is not None and best_inward is not None:
+                    local_margin = 0.15 * min(avg_boundary_len, best_ab_len)
+                    V_collision = relaxed_pos - best_proj
+                    dot_collision = V_collision.dot(best_inward)
+                    if dot_collision < local_margin:
+                        relaxed_pos = best_proj + best_inward * local_margin
                         
                 grid_coords[u][v] = relaxed_pos
 
@@ -2821,4 +2836,6 @@ def update_last_grid(context):
     # Update edit mesh and viewport
     bmesh.update_edit_mesh(topo_obj.data)
     context.area.tag_redraw()
+
+
 
