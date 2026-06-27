@@ -52,17 +52,8 @@ def register():
         min=0.005,
         max=10.0,
         precision=3,
-        step=1.0
-    )
-    bpy.types.Scene.tp_smooth_factor = bpy.props.FloatProperty(
-        name="平滑力度",
-        description="绘制结束后对线条进行自动平滑的强度 (0为不平滑)",
-        default=0.0,
-        min=0.0,
-        max=1.0,
-        precision=2,
-        step=5.0,
-        update=op_grid_fill.on_grid_settings_update
+        step=0.5,
+        update=op_draw.on_edge_length_update
     )
     bpy.types.Scene.tp_use_wrap = bpy.props.BoolProperty(
         name="包裹",
@@ -102,7 +93,6 @@ def unregister():
     del bpy.types.WindowManager.tp_topology_running
     del bpy.types.WindowManager.tp_ref_object_name
     del bpy.types.Scene.tp_edge_length
-    del bpy.types.Scene.tp_smooth_factor
     del bpy.types.Scene.tp_use_wrap
     del bpy.types.Scene.tp_pin_boundary
     del bpy.types.Scene.tp_grid_span

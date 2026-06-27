@@ -10,6 +10,8 @@ from bpy_extras.view3d_utils import (
 
 from .draw_utils import draw_callback, draw_text_callback
 
+_active_draw_operator = None
+
 def is_boundary_edge(e, grid_layer=None):
     """
     检查边是否是边界边（连通面数 <= 1，或者其连接的面属于不同的栅格填充区域，即跨区域边界）
@@ -308,6 +310,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         self.rebuild_kd_tree()
 
         context.window_manager.tp_topology_running = True
+        global _active_draw_operator
+        _active_draw_operator = self
 
         args = (self, context)
         self.draw_handle_lines = bpy.types.SpaceView3D.draw_handler_add(
@@ -2020,9 +2024,6 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if topo_obj.mode != 'EDIT':
             bm_temp.free()
 
-        if not self.is_polyline and not getattr(self, 'bypass_resample', False) and expanded_active_indices:
-            self.resample_loops(context, topo_obj, active_indices=expanded_active_indices)
-            
         if expanded_active_indices:
             self.conform_to_surface(context, active_indices=expanded_active_indices)
         
@@ -2375,68 +2376,9 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 print("Error pushing undo step:", e)
             self.report({'INFO'}, "已生成包围拓扑线")
 
-    def resample_loops(self, context, topo_obj, active_indices=None):
-        is_edit_mode = (topo_obj.mode == 'EDIT')
-        
-        if is_edit_mode:
-            bm = bmesh.from_edit_mesh(topo_obj.data)
-        else:
-            bm = bmesh.new()
-            bm.from_mesh(topo_obj.data)
-            
-        bm.verts.ensure_lookup_table()
-        
-        if active_indices is not None:
-            val2_verts = [v for v in bm.verts if len(v.link_edges) == 2 and v.index in active_indices]
-        else:
-            val2_verts = [v for v in bm.verts if len(v.link_edges) == 2]
-        
-        if not val2_verts:
-            if not is_edit_mode:
-                bm.free()
-            return
-            
-        factor = getattr(context.scene, "tp_smooth_factor", 0.05)
-        if factor < 0.001:
-            if not is_edit_mode:
-                bm.free()
-            return
-            
-        ref_obj = bpy.data.objects.get(self.ref_object_name)
-        if ref_obj:
-            matrix_world = ref_obj.matrix_world
-            matrix_inverse = matrix_world.inverted()
-            topo_inverse = topo_obj.matrix_world.inverted()
-            topo_world = topo_obj.matrix_world
-            
-            iterations = 2
-            for iteration in range(iterations):
-                new_cos = {}
-                for v in val2_verts:
-                    neighbors = [e.other_vert(v) for e in v.link_edges]
-                    avg_co = (neighbors[0].co + neighbors[1].co) / 2.0
-                    new_cos[v] = v.co * (1.0 - factor) + avg_co * factor
-                    
-                for v, co in new_cos.items():
-                    try:
-                        world_co = topo_world @ co
-                        local_target = matrix_inverse @ world_co
-                        success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
-                        if success:
-                            local_pt = location + normal * 0.003
-                            co = topo_inverse @ (matrix_world @ local_pt)
-                    except Exception:
-                        pass
-                    v.co = co
-                
-        if is_edit_mode:
-            bmesh.update_edit_mesh(topo_obj.data)
-        else:
-            bm.to_mesh(topo_obj.data)
-            bm.free()
-            topo_obj.data.update()
-
     def cleanup(self, context):
+        global _active_draw_operator
+        _active_draw_operator = None
         try:
             context.window_manager.tp_topology_running = False
         except Exception:
@@ -2678,7 +2620,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             
         return loops
 
-    def handle_loop_subdivision(self, context, event):
+    def handle_loop_subdivision(self, context, event=None):
         topo_obj_name = "TP_Topology_Mesh"
         topo_obj = bpy.data.objects.get(topo_obj_name)
         if not topo_obj or topo_obj.mode != 'EDIT':
@@ -2719,45 +2661,46 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             self.subdiv_multiplier = 1.0
             
         # 2. Update the subdivision multiplier
-        if event.type == 'WHEELUPMOUSE':
-            self.subdiv_multiplier += 0.1
-        else:
-            # Check if any loop can still be unsubdivided (i.e. has more edges than its minimum limit)
-            can_unsubdivide = False
-            for orig_loop in self.subdiv_original_loops:
-                orig_count = orig_loop['original_count']
-                splicing_indices = orig_loop.get('splicing_indices', set())
-                is_open = (orig_loop['type'] == 'open_path')
-                orig_edges = (orig_count - 1) if is_open else orig_count
-                
-                current_edges = orig_edges * self.subdiv_multiplier
-                if orig_loop['type'] == 'rasterized':
-                    current_edges = round(current_edges / 2) * 2
-                else:
-                    current_edges = round(current_edges)
+        if event is not None:
+            if event.type == 'WHEELUPMOUSE':
+                self.subdiv_multiplier += 0.1
+            else:
+                # Check if any loop can still be unsubdivided (i.e. has more edges than its minimum limit)
+                can_unsubdivide = False
+                for orig_loop in self.subdiv_original_loops:
+                    orig_count = orig_loop['original_count']
+                    splicing_indices = orig_loop.get('splicing_indices', set())
+                    is_open = (orig_loop['type'] == 'open_path')
+                    orig_edges = (orig_count - 1) if is_open else orig_count
                     
-                if orig_loop['type'] == 'open_path':
-                    S_len = len(splicing_indices | {0, orig_count - 1})
-                    num_segs = S_len - 1
-                    min_allowed = max(2, num_segs + 1)
-                else:
-                    num_segs = len(splicing_indices) if splicing_indices else 1
-                    base_min = 8 if orig_loop['type'] == 'rasterized' else 4
-                    min_allowed = max(base_min, num_segs)
+                    current_edges = orig_edges * self.subdiv_multiplier
+                    if orig_loop['type'] == 'rasterized':
+                        current_edges = round(current_edges / 2) * 2
+                    else:
+                        current_edges = round(current_edges)
+                        
+                    if orig_loop['type'] == 'open_path':
+                        S_len = len(splicing_indices | {0, orig_count - 1})
+                        num_segs = S_len - 1
+                        min_allowed = max(2, num_segs + 1)
+                    else:
+                        num_segs = len(splicing_indices) if splicing_indices else 1
+                        base_min = 8 if orig_loop['type'] == 'rasterized' else 4
+                        min_allowed = max(base_min, num_segs)
+                        
+                    min_allowed_edges = (min_allowed - 1) if is_open else min_allowed
                     
-                min_allowed_edges = (min_allowed - 1) if is_open else min_allowed
-                
-                if current_edges > min_allowed_edges:
-                    can_unsubdivide = True
-                    break
+                    if current_edges > min_allowed_edges:
+                        can_unsubdivide = True
+                        break
+                        
+                if not can_unsubdivide:
+                    self.report({'INFO'}, "已达到最小细分限制，无法继续反细分")
+                    return True
                     
-            if not can_unsubdivide:
-                self.report({'INFO'}, "已达到最小细分限制，无法继续反细分")
-                return True
-                
-            self.subdiv_multiplier -= 0.1
-            if self.subdiv_multiplier < 0.1:
-                self.subdiv_multiplier = 0.1
+                self.subdiv_multiplier -= 0.1
+                if self.subdiv_multiplier < 0.1:
+                    self.subdiv_multiplier = 0.1
             
         # Backup the BMesh in case recreation or grid-fill fails
         bm_backup = bm.copy()
@@ -3062,10 +3005,11 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 bm_backup.free()
             
             # Revert the multiplier
-            if event.type == 'WHEELUPMOUSE':
-                self.subdiv_multiplier -= 0.1
-            else:
-                self.subdiv_multiplier += 0.1
+            if event is not None:
+                if event.type == 'WHEELUPMOUSE':
+                    self.subdiv_multiplier -= 0.1
+                else:
+                    self.subdiv_multiplier += 0.1
                 
             self.rebuild_kd_tree()
             self.report({'INFO'}, "由于网格填充失败，已自动撤销该细分级别")
@@ -3117,7 +3061,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             avg_edge_len = sum(total_loop_edge_lens) / len(total_loop_edge_lens)
             context.scene.tp_edge_length = avg_edge_len
             
-        action = "细分" if event.type == 'WHEELUPMOUSE' else "反细分"
+        action = "参数调整" if event is None else ("细分" if event.type == 'WHEELUPMOUSE' else "反细分")
         self.report({'INFO'}, f"已对所有栅格、线段和圈进行全局{action}，当前密度比例：{self.subdiv_multiplier:.2f}")
         context.area.tag_redraw()
         return True
@@ -3608,4 +3552,80 @@ def tp_pin_depsgraph_handler(scene, depsgraph=None):
         print("Error enforcing boundary pin:", e)
     finally:
         _in_pin_handler = False
+
+
+_in_edge_length_update = False
+
+def on_edge_length_update(self, context):
+    global _in_edge_length_update
+    if _in_edge_length_update:
+        return
+    _in_edge_length_update = True
+    try:
+        global _active_draw_operator
+        active_op = _active_draw_operator
+        if active_op is not None:
+            target_edge_length = context.scene.tp_edge_length
+            if target_edge_length > 0.001:
+                topo_obj_name = "TP_Topology_Mesh"
+                topo_obj = bpy.data.objects.get(topo_obj_name)
+                if topo_obj and topo_obj.mode == 'EDIT':
+                    bm = bmesh.from_edit_mesh(topo_obj.data)
+                    
+                    # Initialize the original loops cache if not already done
+                    if getattr(active_op, 'subdiv_original_loops', None) is None:
+                        loops = active_op.find_all_loops(bm)
+                        if loops:
+                            vert_loop_count = {}
+                            for loop in loops:
+                                for v in loop['verts']:
+                                    vert_loop_count[v] = vert_loop_count.get(v, 0) + 1
+                            
+                            active_op.subdiv_original_loops = []
+                            for loop in loops:
+                                splicing_indices = set()
+                                for idx, v in enumerate(loop['verts']):
+                                    if vert_loop_count[v] > 1:
+                                        splicing_indices.add(idx)
+                                        
+                                active_op.subdiv_original_loops.append({
+                                    'type': loop['type'],
+                                    'coords': [v.co.copy() for v in loop['verts']],
+                                    'splicing_indices': splicing_indices,
+                                    'original_count': len(loop['verts']),
+                                    'loop_id': loop.get('loop_id', None)
+                                })
+                    
+                    # Calculate multiplier from target_edge_length
+                    if getattr(active_op, 'subdiv_original_loops', None):
+                        total_len = 0.0
+                        total_edges = 0
+                        for orig_loop in active_op.subdiv_original_loops:
+                            P = orig_loop['coords']
+                            is_open = (orig_loop['type'] == 'open_path')
+                            orig_count = orig_loop['original_count']
+                            orig_edges = (orig_count - 1) if is_open else orig_count
+                            
+                            perimeter = 0.0
+                            for i in range(len(P)):
+                                p1 = P[i]
+                                if is_open:
+                                    if i == len(P) - 1:
+                                        continue
+                                    p2 = P[i + 1]
+                                else:
+                                    p2 = P[(i + 1) % len(P)]
+                                perimeter += (p2 - p1).length
+                            total_len += perimeter
+                            total_edges += orig_edges
+                            
+                        if total_edges > 0:
+                            new_multiplier = (total_len / target_edge_length) / total_edges
+                            active_op.subdiv_multiplier = max(0.01, new_multiplier)
+                            active_op.handle_loop_subdivision(context, event=None)
+    except Exception as e:
+        print("Error in on_edge_length_update:", e)
+    finally:
+        _in_edge_length_update = False
+
 

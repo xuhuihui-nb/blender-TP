@@ -860,13 +860,14 @@ def compute_vertex_normal_from_curr_cos(v, F, curr_cos):
     return v.normal.normalized()
 
 
-def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3):
+def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_factor=0.3):
     """
     对网格中所有已填充的拼接栅格区域进行全局拓扑优化（整体调优）。
     保持最外层边界点不动，释放所有内部顶点以及不同栅格区域之间的共享边界顶点，
     通过拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热机制 + 双向射线/最近点贴合投影 + 物理边界碰撞，
     使得所有拼接的栅格过渡平滑自然。
     """
+    smooth_factor = 0.4
     grid_layer = bm.faces.layers.int.get("tp_is_grid")
     if not grid_layer:
         return
@@ -1101,10 +1102,11 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, smooth_f
                 v.co = relaxed_pos
 
 
-def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor, spring_factor, selected_verts=None, selected_edges=None, user_span=0, user_offset=0):
+def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor, selected_verts=None, selected_edges=None, user_span=0, user_offset=0):
     """
     对非线性拼接圈进行多区域栅格填充，全局协调各子圈的划分参数以达到上下承接效果
     """
+    smooth_factor = 0.4
     comp_verts = comp['verts']
     comp_edges = comp['edges']
     
@@ -1285,7 +1287,6 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, smooth_factor
             ref_obj=ref_obj,
             topo_obj=topo_obj,
             iterations=iterations,
-            smooth_factor=smooth_factor,
             spring_factor=spring_factor
         )
         
@@ -1652,10 +1653,11 @@ def init_coons_grid(loop_verts, M, N, offset):
     return grid_coords
 
 
-def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_factor=0.4, spring_factor=0.3):
+def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_factor=0.3):
     """
     拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热机制 + 渐进式拓扑拉力控制 + 双向射线/最近点贴合投影 + 物理边界碰撞与安全守护
     """
+    smooth_factor = 0.4
     # 估算网格的整体法线方向，用于边界碰撞检测与默认投影方向
     c00 = grid_coords[0][0]
     c10 = grid_coords[M][0]
@@ -1835,7 +1837,7 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_fa
                     t = t_val / col_len
                     y_target = v / N
                     
-                    # 仅在纵向上往理想拓扑高度微调，防止行重叠
+                    # 浠呭湪绾靛悜涓婂線鐞嗘兂鎷撴墤楂樺害寰皟锛岄槻姝㈣閲嶅彔
                     t_new = t + 0.15 * (y_target - t)
                     relaxed_pos = relaxed_pos + ((t_new - t) * col_len) * col_dir
                         
@@ -1850,15 +1852,13 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, smooth_fa
                     s = s_val / row_len
                     x_target = u / M
                     
-                    # 仅在横向上往理想拓扑宽度微调，防止列重叠
+                    # 浠呭湪妯悜涓婂線鐞嗘兂鎷撴墤瀹藉害寰皟锛岄槻姝㈠垪閲嶅彔
                     s_new = s + 0.15 * (x_target - s)
                     relaxed_pos = relaxed_pos + ((s_new - s) * row_len) * row_dir
 
-                # D. 贴合高模表面（使用双向射线投影 + 备用最近点投影）
-                if should_project:
+                # D. 璐村悎楂樻ā琛ㄩ潰锛堜娇鐢ㄥ弻鍚戝皠绾挎姇褰?+ 澶囩敤鏈€杩戠偣鎶曞奖锛?                if should_project:
                     try:
-                        # 转换当前位置到高模空间，获取投影射线起点与方向
-                        world_pos = topo_world @ pos
+                        # 杞崲褰撳墠浣嶇疆鍒伴珮妯＄┖闂达紝鑾峰彇鎶曞奖灏勭嚎璧风偣涓庢柟鍚?                        world_pos = topo_world @ pos
                         world_normal = (topo_world.to_3x3() @ grid_normal).normalized()
                         
                         local_origin = matrix_inverse_ref @ world_pos
@@ -1977,14 +1977,6 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         description="内部网格松弛优化的迭代次数"
     )
     
-    smooth_factor: bpy.props.FloatProperty(
-        name="平滑力度",
-        default=0.4,
-        min=0.0,
-        max=1.0,
-        description="拉普拉斯平滑的权重，使网格过渡平顺"
-    )
-    
     spring_factor: bpy.props.FloatProperty(
         name="边长均匀度",
         default=0.3,
@@ -2018,24 +2010,10 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
         return obj is not None and obj.type == 'MESH' and obj.mode == 'EDIT'
         
     def invoke(self, context, event):
-        self.smooth_factor = context.scene.tp_smooth_factor
         return self.execute(context)
         
     def execute(self, context):
         global _in_grid_update
-        if self.is_auto:
-            self.smooth_factor = context.scene.tp_smooth_factor
-            
-
-            
-        if self.smooth_factor != context.scene.tp_smooth_factor:
-            orig_in_update = _in_grid_update
-            _in_grid_update = True
-            try:
-                context.scene.tp_smooth_factor = self.smooth_factor
-            finally:
-                _in_grid_update = orig_in_update
-
         topo_obj = context.active_object
         if not topo_obj or topo_obj.type != 'MESH':
             self.report({'ERROR'}, "活动对象不是网格体")
@@ -2168,7 +2146,6 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     ref_obj=ref_obj, 
                     topo_obj=topo_obj, 
                     iterations=self.iterations, 
-                    smooth_factor=self.smooth_factor, 
                     spring_factor=self.spring_factor
                 )
                 
@@ -2224,7 +2201,6 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                     ref_obj=ref_obj,
                     topo_obj=topo_obj,
                     iterations=self.iterations,
-                    smooth_factor=self.smooth_factor,
                     spring_factor=self.spring_factor,
                     selected_verts=selected_verts_extended,
                     selected_edges=selected_edges_extended,
@@ -2242,7 +2218,6 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
             global_optimize_spliced_grids(
                 bm, ref_obj, topo_obj,
                 iterations=self.iterations,
-                smooth_factor=self.smooth_factor,
                 spring_factor=self.spring_factor
             )
         
@@ -2600,7 +2575,6 @@ def update_last_grid(context):
             ref_obj=ref_obj,
             topo_obj=topo_obj,
             iterations=40,
-            smooth_factor=scene.tp_smooth_factor,
             spring_factor=0.3
         )
         
@@ -2645,35 +2619,16 @@ def update_last_grid(context):
     global_optimize_spliced_grids(
         bm, ref_obj, topo_obj,
         iterations=40,
-        smooth_factor=scene.tp_smooth_factor,
         spring_factor=0.3
     )
     
     # === 物理记忆与投影追踪恢复 ===
     bm.verts.ensure_lookup_table()
     
-    # 1. 恢复保留点的选中状态
+    # 1. 恢复保留点（外圈边界点）的选中状态
     for idx in keep_selected_indices:
         if idx < len(bm.verts):
             bm.verts[idx].select = True
-            
-    # 2. 针对被物理删除点，通过最近邻算法在重建后的新网格中寻找最佳替代点
-    for old_co in deleted_selected_cos:
-        closest_v = None
-        min_dist = float('inf')
-        for v in bm.verts:
-            dist = (v.co - old_co).length
-            if dist < min_dist:
-                min_dist = dist
-                closest_v = v
-        if closest_v and min_dist < 0.2:
-            closest_v.select = True
-            
-    # 刷新选择历史，确保活动项正确
-    selected_verts_after = [v for v in bm.verts if v.select]
-    if selected_verts_after:
-        bm.select_history.clear()
-        bm.select_history.add(selected_verts_after[-1])
         
     # 合并极其接近的重复顶点，确保完美的接缝缝合
     bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)

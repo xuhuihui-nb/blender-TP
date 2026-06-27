@@ -46,8 +46,7 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
             row_front.prop(scene, "tp_pin_boundary", text="固定", toggle=True, icon='PINNED')
         
         col.separator()
-        col.prop(scene, "tp_edge_length", text="边长", slider=True)
-        col.prop(scene, "tp_smooth_factor", text="平滑力度", slider=True)
+        col.prop(scene, "tp_edge_length", text="边长")
         
         if wm.tp_topology_running or (obj and obj.name == "TP_Topology_Mesh"):
             col.separator()
