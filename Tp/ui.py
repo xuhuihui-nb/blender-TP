@@ -97,28 +97,31 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
         if scene.tp_show_tutorial:
             col_t = box.column(align=True)
             
-            col_t.label(text="【起步】", icon='PLAY')
-            col_t.label(text="• 选中网格对象 -> 点击【拓扑】开始")
+            col_t.label(text="【起步与退出】", icon='PLAY')
+            col_t.label(text="• 启动拓扑: 选中高模网格 -> 点击【拓扑】按钮")
+            col_t.label(text="• 退出拓扑: 按 ESC 键 或 再次点击【拓扑】按钮")
             
             col_t.separator()
             col_t.label(text="【绘制拓扑线】", icon='GREASEPENCIL')
             col_t.label(text="• 连续画线: 按住 Ctrl + 左键拖动")
-            col_t.label(text="• 多段画线: 按住 Ctrl + 左键单击 (Enter键提交)")
-            col_t.label(text="• 自动合并: 靠近起点或已有顶点时自动吸附合并")
+            col_t.label(text="• 多段画线: 按住 Ctrl + 左键单击 (回车键/Enter提交)")
+            col_t.label(text="• 自动合并: 靠近起点或已有顶点时自动吸附并合并")
             col_t.label(text="• 取消绘制: 绘制未提交时，点击右键取消")
-            col_t.label(text="• 撤销重做: Ctrl + Z 撤销 / Ctrl + Y 重做")
+            col_t.label(text="• 撤销重做: Ctrl + Z 撤销 (多段画线时撤销上一个点) / Ctrl + Y 重做")
             
             col_t.separator()
             col_t.label(text="【编辑与调整】", icon='GRIP')
             col_t.label(text="• 循环边选择: Alt + 左键点击顶点/边")
             col_t.label(text="  (多次点击切换候选路径，按 Shift 追加选择)")
-            col_t.label(text="• 移动顶点: 选中点后按 G 键移动 (左键/Enter确认)")
+            col_t.label(text="• 移动顶点: 悬停在点附近按 G 键直接移动，或选中后按 G 键")
+            col_t.label(text="  (鼠标左键/回车/空格确认，鼠标右键/ESC取消)")
             col_t.label(text="• 循环细分: 按住 Ctrl + 鼠标滚轮调整细分")
             
             col_t.separator()
             col_t.label(text="【快捷栅格填充】", icon='GRID')
             col_t.label(text="• 选择闭合圈: Alt + 左键选中边界线圈")
-            col_t.label(text="• 调整参数: 在上方微调面板设置【跨分】与【偏移】")
             col_t.label(text="• 生成网格: 点击【栅格填充】")
+            col_t.label(text="• 实时微调: 选中已填充的栅格(或不选任何元素)在面板修改【跨分】与【偏移】可实时更新")
+            col_t.label(text="• 移除栅格: 选中已填充的栅格(或不选任何元素)点击【移除栅格】")
 
 
