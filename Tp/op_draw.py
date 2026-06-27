@@ -1506,24 +1506,32 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if n < 2:
             return points
             
-        edge_len = context.scene.tp_edge_length
-        if edge_len < 0.001:
-            edge_len = 0.001
-            
         dists = [0.0]
         for i in range(n - 1):
             dists.append(dists[-1] + (points[i+1] - points[i]).length)
             
         total_len = dists[-1]
         if total_len < 0.001:
+            if context.scene.tp_use_fixed_point_count:
+                return [points[0]] * max(1, context.scene.tp_fixed_point_count)
             return [points[0]] * 4
             
-        if is_closed:
-            n_initial = max(3, round(total_len / edge_len))
+        if context.scene.tp_use_fixed_point_count:
+            target_count = context.scene.tp_fixed_point_count
+            if is_closed:
+                M = max(3, target_count)
+            else:
+                M = max(2, target_count)
         else:
-            n_initial = max(2, round(total_len / edge_len) + 1)
-            
-        M = max(4, int((n_initial + 2) / 4) * 4)
+            edge_len = context.scene.tp_edge_length
+            if edge_len < 0.001:
+                edge_len = 0.001
+            if is_closed:
+                n_initial = max(3, round(total_len / edge_len))
+            else:
+                n_initial = max(2, round(total_len / edge_len) + 1)
+                
+            M = max(4, int((n_initial + 2) / 4) * 4)
         
         resampled = []
         
@@ -1546,7 +1554,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             resampled.append(resampled[0])
         else:
             for j in range(M):
-                target_d = (j / (M - 1)) * total_len
+                target_d = (j / (M - 1)) * total_len if M > 1 else 0.0
                 idx = 1
                 for k in range(1, len(dists)):
                     if dists[k] >= target_d:
@@ -1736,30 +1744,37 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             seg_points.append(pts)
             seg_snap_indices.append(snaps)
             
-        initial_edges = []
-        for l_seg in seg_lengths:
-            initial_edges.append(max(1, round(l_seg / edge_len)))
-            
-        total_initial_edges = sum(initial_edges)
-        
-        if is_closed:
-            V_target = max(4, int((total_initial_edges + 2) / 4) * 4)
-            E_target = V_target
+        if context.scene.tp_use_fixed_point_count:
+            target_count = context.scene.tp_fixed_point_count
+            if is_closed:
+                E_target = max(max(3, num_segs), target_count)
+            else:
+                E_target = max(max(1, num_segs), target_count - 1)
         else:
-            V_target = max(4, int((total_initial_edges + 1 + 2) / 4) * 4)
-            E_target = V_target - 1
+            initial_edges = []
+            for l_seg in seg_lengths:
+                initial_edges.append(max(1, round(l_seg / edge_len)))
+                
+            total_initial_edges = sum(initial_edges)
             
-            if path_edges is not None:
-                E_existing = len(path_edges)
-                remainder = E_existing % 4
-                target_mod = (4 - remainder) % 4
-                current_mod = total_initial_edges % 4
-                diff = target_mod - current_mod
-                if diff > 2:
-                    diff -= 4
-                elif diff < -2:
-                    diff += 4
-                E_target = max(1, total_initial_edges + diff)
+            if is_closed:
+                V_target = max(4, int((total_initial_edges + 2) / 4) * 4)
+                E_target = V_target
+            else:
+                V_target = max(4, int((total_initial_edges + 1 + 2) / 4) * 4)
+                E_target = V_target - 1
+                
+                if path_edges is not None:
+                    E_existing = len(path_edges)
+                    remainder = E_existing % 4
+                    target_mod = (4 - remainder) % 4
+                    current_mod = total_initial_edges % 4
+                    diff = target_mod - current_mod
+                    if diff > 2:
+                        diff -= 4
+                    elif diff < -2:
+                        diff += 4
+                    E_target = max(1, total_initial_edges + diff)
         
         total_len = sum(seg_lengths)
         log_lines.append(f"Total segment length (surface): {total_len:.4f}, E_target: {E_target}")
@@ -2049,7 +2064,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             bmesh.update_edit_mesh(topo_obj.data)
 
             # Check if a closed loop is generated, and if so, perform grid fill immediately
-            from .op_grid_fill import analyze_selection
+            from .op_grid_fill import analyze_selection, find_minimum_cycle_basis, trace_cycle_verts, check_is_grid_filled
             
             bm = bmesh.from_edit_mesh(topo_obj.data)
             bm.verts.ensure_lookup_table()
@@ -2086,6 +2101,25 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             if components and not err_msg:
                 for comp in components:
                     if comp['type'] in {'loop', 'non_linear_loops'} and not comp.get('is_grid_filled', False):
+                        if context.scene.tp_use_fixed_point_count:
+                            if comp['type'] == 'loop':
+                                num_points = len(comp['vert_indices'])
+                                if num_points % 4 != 0:
+                                    continue
+                            elif comp['type'] == 'non_linear_loops':
+                                raw_cycles = find_minimum_cycle_basis(bm, comp['verts'], comp['edges'])
+                                if raw_cycles:
+                                    all_cycles_valid = True
+                                    for c in raw_cycles:
+                                        cycle_verts = trace_cycle_verts(c)
+                                        if not check_is_grid_filled(bm, cycle_verts, c):
+                                            if len(cycle_verts) % 4 != 0:
+                                                all_cycles_valid = False
+                                                break
+                                    if not all_cycles_valid:
+                                        continue
+                                else:
+                                    continue
                         has_valid_unfilled_loop = True
                         break
             

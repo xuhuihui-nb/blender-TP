@@ -55,6 +55,17 @@ def register():
         step=0.5,
         update=op_draw.on_edge_length_update
     )
+    bpy.types.Scene.tp_use_fixed_point_count = bpy.props.BoolProperty(
+        name="点的数量",
+        description="开启后，绘制的圈或线点的数量固定为指定的数量（不含栅格化的点）",
+        default=False
+    )
+    bpy.types.Scene.tp_fixed_point_count = bpy.props.IntProperty(
+        name="点数",
+        description="指定的点的数量",
+        default=0,
+        min=0
+    )
     bpy.types.Scene.tp_use_wrap = bpy.props.BoolProperty(
         name="包裹",
         description="拓扑时自动吸附并使用收缩包裹贴合表面",
@@ -77,6 +88,8 @@ def register():
         name="偏移",
         description="网格顶点的起点偏移量",
         default=0,
+        min=-100000,
+        max=100000,
         update=op_grid_fill.on_grid_settings_update
     )
     bpy.types.Scene.tp_show_tutorial = bpy.props.BoolProperty(
@@ -93,6 +106,8 @@ def unregister():
     del bpy.types.WindowManager.tp_topology_running
     del bpy.types.WindowManager.tp_ref_object_name
     del bpy.types.Scene.tp_edge_length
+    del bpy.types.Scene.tp_use_fixed_point_count
+    del bpy.types.Scene.tp_fixed_point_count
     del bpy.types.Scene.tp_use_wrap
     del bpy.types.Scene.tp_pin_boundary
     del bpy.types.Scene.tp_grid_span
