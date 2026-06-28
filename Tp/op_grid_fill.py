@@ -56,53 +56,45 @@ def check_is_grid_filled(bm, loop_verts, cycle_edges):
     # 进行双向比例校验，确保该空洞或已填充圈与栅格边界能完美匹配
     intersection = cycle_edges_set.intersection(filled_boundary_edges)
     if len(cycle_edges_set) > 0:
-        ratio_loop = len(intersection) / len(cycle_edges_set)
-        
-        # 情况 A: 标准网格边界匹配
-        if len(filled_boundary_edges) > 0:
-            ratio_grid = len(intersection) / len(filled_boundary_edges)
-            if ratio_loop > 0.8 and ratio_grid > 0.8:
-                return True
+        # 找出现有连通网格边界中，最长的独立循环的长度
+        max_b_len = 0
+        visited_b = set()
+        adj_b = {}
+        for e in filled_boundary_edges:
+            for v in e.verts:
+                adj_b.setdefault(v, []).append(e)
                 
-        # 情况 B: 环形多孔网格的外围大边界（例如包围 A 圈的外围整体边界）
-        # 此时 ratio_grid 因为包含内圈孔洞边界而偏低，但 ratio_loop 依然很高。
-        # 我们通过比较“圈所围成的面积”与“连通面片的总面积”来判定：
-        # 如果 loop_area > 0.8 * total_face_area，说明该圈是包围已填充区域的外围大圈；
-        # 如果是内圈孔洞，其面积会明显小于连通面片的总面积，从而被正确判定为未填充。
-        if ratio_loop > 0.8:
-            # 计算 Loop 质心
-            centroid = sum((v.co for v in loop_verts), Vector((0,0,0))) / len(loop_verts)
-            # 计算 Loop 的平均法线
-            normal = Vector((0,0,0))
-            n = len(loop_verts)
-            for i in range(n):
-                v1 = loop_verts[i].co - centroid
-                v2 = loop_verts[(i+1)%n].co - centroid
-                normal += v1.cross(v2)
-            normal.normalize()
-            
-            # 构建投影平面正交基
-            if abs(normal.x) < 0.9:
-                ref = Vector((1, 0, 0))
-            else:
-                ref = Vector((0, 1, 0))
-            T = normal.cross(ref).normalized()
-            B = normal.cross(T).normalized()
-            
-            # 计算 Loop 的 2D 投影面积（鞋带公式）
-            loop_area = 0.0
-            for i in range(n):
-                x1, y1 = loop_verts[i].co.dot(T), loop_verts[i].co.dot(B)
-                x2, y2 = loop_verts[(i+1)%n].co.dot(T), loop_verts[(i+1)%n].co.dot(B)
-                loop_area += (x1 * y2 - x2 * y1)
-            loop_area = abs(loop_area) * 0.5
-            
-            # 计算连通面片的总 3D 面积
-            total_face_area = sum(f.calc_area() for f in filled_faces)
-            
-            if loop_area > 0.8 * total_face_area:
+        for e in filled_boundary_edges:
+            if e in visited_b: continue
+            curr_len = 0
+            q = [e]
+            visited_b.add(e)
+            while q:
+                curr_e = q.pop()
+                curr_len += 1
+                for v in curr_e.verts:
+                    for nbr_e in adj_b.get(v, []):
+                        if nbr_e not in visited_b:
+                            visited_b.add(nbr_e)
+                            q.append(nbr_e)
+            if curr_len > max_b_len:
+                max_b_len = curr_len
+
+        # 严格边界判断：如果圈完全由已有边界组成
+        if len(intersection) == len(cycle_edges_set):
+            # 只有最大边界被认为是外围（已填充），其他较小边界认为是孔洞（未填充）
+            if len(intersection) >= max_b_len:
                 return True
-            
+            else:
+                return False
+        else:
+            # 混合边界判断：圈包含新绘制的边
+            # 根据它包含的已有边界长度，决定它是要保留的主体(True)，还是要填充的部分(False)
+            if len(intersection) > 0.5 * max_b_len:
+                return True
+            else:
+                return False
+                
     return False
 
 
@@ -1805,105 +1797,137 @@ def init_coons_grid(loop_verts, M, N, offset):
 
 def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_factor=0.3):
     """
-    拉普拉斯平滑 + 局部自适应直联/对角弹簧 + 预松弛预热机制 + 渐进式拓扑拉力控制 + 双向射线/最近点贴合投影 + 物理边界碰撞与安全守护
-    """
-    smooth_factor = 0.4
-    # 估算网格的整体法线方向，用于边界碰撞检测与默认投影方向
-    c00 = grid_coords[0][0]
-    c10 = grid_coords[M][0]
-    c01 = grid_coords[0][N]
-    normal_dir = (c10 - c00).cross(c01 - c00).normalized()
-    
-    # 1. 预计算每个网格边局部的目标长度
-    # 计算四条边界 of 各段弦长
-    # Bottom 边界 (v = 0): u = 0..M-1
-    L_bottom = [0.0] * M
-    for u in range(M):
-        L_bottom[u] = (grid_coords[u+1][0] - grid_coords[u][0]).length
-        
-    # Top 边界 (v = N): u = 0..M-1
-    L_top = [0.0] * M
-    for u in range(M):
-        L_top[u] = (grid_coords[u+1][N] - grid_coords[u][N]).length
-        
-    # 双线性插值预计算网格中每一条边的目标长度
-    # target_u[u][v] 表示连接 (u,v) 和 (u+1,v) 的边长，尺寸为 M x (N+1)
-    target_u = [[0.0 for _ in range(N + 1)] for _ in range(M)]
-    for u in range(M):
-        for v in range(N + 1):
-            target_u[u][v] = (1.0 - v / N) * L_bottom[u] + (v / N) * L_top[u]
-            
-    # target_v[u][v] 表示连接 (u,v) 和 (u,v+1) 的边长，尺寸为 (M+1) x N
-    # 对于纵向边，我们使用该列首尾边界点之间的实际距离进行平分，防止在两端极窄的凹陷结构中出现弹簧缩水导致的网格堆叠。
-    target_v = [[0.0 for _ in range(N)] for _ in range(M + 1)]
-    for u in range(M + 1):
-        col_len = (grid_coords[u][N] - grid_coords[u][0]).length
-        avg_len = col_len / N if N > 0 else 0.0
-        for v in range(N):
-            target_v[u][v] = avg_len
-            
-    # target_diag[u][v] 表示 cell(u,v) 的对角线目标长度，尺寸为 M x N
-    target_diag = [[0.0 for _ in range(N)] for _ in range(M)]
-    for u in range(M):
-        for v in range(N):
-            # 取周围四个直连接局部边长的平均，然后按勾股定理估算对角线长
-            lu = (target_u[u][v] + target_u[u][v+1]) / 2.0
-            lv = (target_v[u][v] + target_v[u+1][v]) / 2.0
-            target_diag[u][v] = (lu*lu + lv*lv) ** 0.5
+    閲嶅啓鐗堬細鍚屼鸡杩炵画娉?(Homotopy) + Winslow 鍏卞舰骞虫粦銆?    淇浜嗘柟鍚戠炕杞鑷磋帿姣斾箤鏂壄缁撶殑鑷村懡婕忔礊锛?    """
+    from mathutils import Vector
+    import math
 
-    # 计算全局边界平均边长，用于投影最大偏移阈值检测
-    sum_left = sum((grid_coords[0][v+1] - grid_coords[0][v]).length for v in range(N))
-    sum_right = sum((grid_coords[M][v+1] - grid_coords[M][v]).length for v in range(N))
-    avg_boundary_len = (sum(L_bottom) + sum(L_top) + sum_left + sum_right) / (2 * (M + N))
-    
-    # 构造边界循环顶点坐标列表，用于物理边界碰撞与安全守护
-    boundary_loop = []
-    for u in range(M):
-        boundary_loop.append(grid_coords[u][0])
-    for v in range(N):
-        boundary_loop.append(grid_coords[M][v])
-    for u in range(M, 0, -1):
-        boundary_loop.append(grid_coords[u][N])
-    for v in range(N, 0, -1):
-        boundary_loop.append(grid_coords[0][v])
-        
-    # 确保 boundary_loop 是逆时针 (CCW) 方向，以便叉乘计算的法线始终指向多边形内部
-    total_area = 0.0
-    for idx in range(len(boundary_loop)):
-        p_curr = boundary_loop[idx]
-        p_next = boundary_loop[(idx + 1) % len(boundary_loop)]
-        total_area += p_curr.cross(p_next).dot(normal_dir)
-    if total_area < 0:
-        boundary_loop.reverse()
+    # 1. 鎻愬彇鐩爣杈圭晫 (Target Boundary)
+    target_loop = []
+    for u in range(M): target_loop.append(grid_coords[u][0].copy())
+    for v in range(N): target_loop.append(grid_coords[M][v].copy())
+    for u in range(M, 0, -1): target_loop.append(grid_coords[u][N].copy())
+    for v in range(N, 0, -1): target_loop.append(grid_coords[0][v].copy())
+    L_bnd = len(target_loop)
 
-    # Bug4修复：预计算每条边界段的「朝内」方向
-    # 使用网格中心与边界边段中点的连线方向，确保在三维曲面上朝内方向始终正确
-    grid_center = Vector((0.0, 0.0, 0.0))
-    count_pts = 0
-    for u in range(M + 1):
-        for v in range(N + 1):
-            grid_center += grid_coords[u][v]
-            count_pts += 1
-    if count_pts > 0:
-        grid_center /= count_pts
+    # 2. 璁＄畻鍑犱綍涓績鍜屾姇褰卞熀鍚戦噺
+    grid_center = sum(target_loop, Vector((0,0,0))) / L_bnd
+    
+    # 浣跨敤 Newell 娉曞垯璁＄畻椴佹鐨勫杈瑰舰娉曠嚎锛屽交搴曡В鐣?
+    normal_dir = Vector((0, 0, 0))
+    for i in range(L_bnd):
+        normal_dir += target_loop[i].cross(target_loop[(i+1)%L_bnd])
+    
+    if normal_dir.length > 1e-6:
+        normal_dir.normalize()
+    else:
+        normal_dir = Vector((0, 0, 1))
+
+    # 鏋勫缓灞€閮ㄥ潗鏍囩郴
+    axes = [Vector((1,0,0)), Vector((0,1,0)), Vector((0,0,1))]
+    axes.sort(key=lambda ax: abs(ax.dot(normal_dir)))
+    U_axis = normal_dir.cross(axes[0]).normalized()
+    V_axis = normal_dir.cross(U_axis).normalized()
+
+    # 3. 纭畾鐩爣杈圭晫鍦ㄥ眬閮ㄥ钩闈㈢殑璧板悜
+    signed_area = 0.0
+    for i in range(L_bnd):
+        p1 = target_loop[i] - grid_center
+        p2 = target_loop[(i+1)%L_bnd] - grid_center
+        u1 = p1.dot(U_axis); v1 = p1.dot(V_axis)
+        u2 = p2.dot(U_axis); v2 = p2.dot(V_axis)
+        signed_area += (u1 * v2 - u2 * v1)
+        
+    direction_sign = 1.0 if signed_area >= 0 else -1.0
+
+    # 4. 生成理想边界 (Ideal Convex Boundary) via Curve Shortening Flow (CSF)
+    edge_lengths = [(target_loop[(i+1)%L_bnd] - target_loop[i]).length for i in range(L_bnd)]
+    perimeter = sum(edge_lengths)
+    if perimeter < 1e-6:
+        perimeter = 1e-6
+        
+    avg_boundary_len = perimeter / max(L_bnd, 1)
+    
+    len_u = sum(edge_lengths[i] for i in range(M)) + sum(edge_lengths[i] for i in range(M+N, 2*M+N))
+    len_v = sum(edge_lengths[i] for i in range(M, M+N)) + sum(edge_lengths[i] for i in range(2*M+N, 2*M+2*N))
+    L0_U = len_u / (2.0 * max(M, 1))
+    L0_V = len_v / (2.0 * max(N, 1))
+
+    morph_steps = 600
+    loop_sequence = [ [v.copy() for v in target_loop] ]
+    current_bnd = loop_sequence[0]
+    
+    for step in range(morph_steps):
+        new_bnd = []
+        for i in range(L_bnd):
+            prev_p = current_bnd[(i - 1) % L_bnd]
+            next_p = current_bnd[(i + 1) % L_bnd]
+            curr_p = current_bnd[i]
+            
+            lap_vec = (prev_p + next_p) * 0.5 - curr_p
+            tangent = (next_p - prev_p)
+            tangent_len_sq = tangent.length_squared
+            if tangent_len_sq > 1e-12:
+                tangent_dir = tangent / math.sqrt(tangent_len_sq)
+                lap_normal = lap_vec - lap_vec.dot(tangent_dir) * tangent_dir
+            else:
+                lap_normal = lap_vec
+                
+            new_bnd.append(curr_p + lap_normal * 0.3)
+            
+        center = sum(new_bnd, Vector()) / L_bnd
+        curr_perim = sum((new_bnd[(i+1)%L_bnd] - new_bnd[i]).length for i in range(L_bnd))
+        if curr_perim > 1e-6:
+            scale = perimeter / curr_perim
+            for i in range(L_bnd):
+                new_bnd[i] = center + (new_bnd[i] - center) * scale
+                
+        current_bnd = new_bnd
+        loop_sequence.append(current_bnd)
+        
+    ideal_loop = loop_sequence[-1]
+
+    # 5. 鐢熸垚鐞嗘兂杈圭晫涓嬬殑鏃犱氦鍙夊垵濮嬬綉鏍?(Ideal Coons Patch)
+    def set_grid_boundary(coords, bnd_loop):
+        idx = 0
+        for u in range(M): 
+            coords[u][0] = bnd_loop[idx]; idx += 1
+        for v in range(N): 
+            coords[M][v] = bnd_loop[idx]; idx += 1
+        for u in range(M, 0, -1): 
+            coords[u][N] = bnd_loop[idx]; idx += 1
+        for v in range(N, 0, -1): 
+            coords[0][v] = bnd_loop[idx]; idx += 1
+
+    set_grid_boundary(grid_coords, ideal_loop)
+    for u in range(1, M):
+        x = u / M
+        for v in range(1, N):
+            y = v / N
+            A = grid_coords[u][0]
+            C = grid_coords[u][N]
+            D = grid_coords[0][v]
+            B = grid_coords[M][v]
+            c00_pt = grid_coords[0][0]; c10_pt = grid_coords[M][0]
+            c01_pt = grid_coords[0][N]; c11_pt = grid_coords[M][N]
+            P = (1.0 - y) * A + y * C + (1.0 - x) * D + x * B - \
+                ((1.0 - x) * (1.0 - y) * c00_pt + x * (1.0 - y) * c10_pt + \
+                 (1.0 - x) * y * c01_pt + x * y * c11_pt)
+            grid_coords[u][v] = P
+
+        # 杈圭晫纰版挒鍐呭悜鍚戦噺 (姝ｇ‘鐨勫嚑浣曡绠楋紝褰诲簳淇榛戞礊 Bug)
     boundary_inwards_precomp = []
-    for idx in range(len(boundary_loop)):
-        p_curr = boundary_loop[idx]
-        p_next = boundary_loop[(idx + 1) % len(boundary_loop)]
-        mid = (p_curr + p_next) / 2.0
-        inward = grid_center - mid
+    for idx in range(L_bnd):
+        p_curr = target_loop[idx]
+        p_next = target_loop[(idx + 1) % L_bnd]
         AB = p_next - p_curr
-        ab_len_sq = AB.length_squared
-        if ab_len_sq > 1e-12:
-            # 去掉沿边方向的分量，只保留垂直于边的朝内分量
-            edge_dir = AB / (ab_len_sq ** 0.5)
-            inward = inward - inward.dot(edge_dir) * edge_dir
-        if inward.length > 1e-6:
-            boundary_inwards_precomp.append(inward.normalized())
+        if AB.length > 1e-12:
+            edge_dir = AB.normalized()
+            # 鍙変箻娉曪細闈㈡硶绾?cross 杈圭晫鍒囩嚎 = 缁濆鎸囧悜澶氳竟褰㈠唴閮ㄧ殑娉曠嚎
+            inward = normal_dir.cross(edge_dir).normalized()
+            boundary_inwards_precomp.append(inward)
         else:
             boundary_inwards_precomp.append(normal_dir.copy())
-    
-    # 2. 准备高模空间变换矩阵
+            
     if ref_obj and topo_obj:
         matrix_world_ref = ref_obj.matrix_world
         matrix_inverse_ref = matrix_world_ref.inverted()
@@ -1911,123 +1935,129 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
         topo_inverse = topo_obj.matrix_world.inverted()
     else:
         matrix_world_ref = None
-        
-    # 预松弛（Warm-up）迭代次数：前 30% 迭代不投影，只在 3D 中将网格结构拉均匀以解开折叠
-    warmup_iters = int(iterations * 0.3)
+
+    # 强制增加迭代次数以保证动态平衡
+    total_iters = max(iterations, 300)
+    pre_smooth_iters = 50   # 初始凸包预平滑
+    morph_iters = int((total_iters - pre_smooth_iters) * 0.6)
+    proj_iters = total_iters - int(total_iters * 0.15)
     
-    # 3. 迭代松弛
-    initial_coords = [[grid_coords[u][v].copy() for v in range(N + 1)] for u in range(M + 1)]
-    for step in range(iterations):
-        should_project = (matrix_world_ref is not None) and (step >= warmup_iters)
+    # 6. 同伦平滑迭代 (Homotopy + Winslow)
+    for step in range(total_iters):
+        if step < pre_smooth_iters:
+            t = 0.0
+        else:
+            t = (step - pre_smooth_iters + 1) / morph_iters if morph_iters > 0 else 1.0
+        t = min(1.0, max(0.0, t))
         
-        # 复制当前点坐标
-        curr_coords = [[grid_coords[u][v].copy() for v in range(N + 1)] for u in range(M + 1)]
+        # Smoothstep to ease the morphing speed at the beginning and end
+        t_smooth = t * t * (3.0 - 2.0 * t)
+        
+        # 变形边界 (采用无自交的 CSF 序列)
+        seq_idx = int((1.0 - t_smooth) * morph_steps)
+        seq_idx = max(0, min(morph_steps, seq_idx))
+        current_loop = loop_sequence[seq_idx]
+        set_grid_boundary(grid_coords, current_loop)
+        
+        should_project = (matrix_world_ref is not None) and (step >= proj_iters)
+        
+        # 增加内部松弛迭代次数，确保内部网格能跟上边界变形的速度，彻底防止变形过快导致的网格纠缠
+        inner_sweeps = 8 if step < proj_iters else 1
+        for sweep in range(inner_sweeps):
+            curr_coords = [[grid_coords[u][v].copy() for v in range(N + 1)] for u in range(M + 1)]
         
         for u in range(1, M):
             for v in range(1, N):
                 pos = curr_coords[u][v]
                 
-                # 计算局部网格法线，用于投影和边界碰撞检测（提取到最前面，保证全局可用且最新）
-                tangent_u = curr_coords[u+1][v] - curr_coords[u-1][v]
-                tangent_v = curr_coords[u][v+1] - curr_coords[u][v-1]
-                cross_prod = tangent_u.cross(tangent_v)
-                if cross_prod.length > 1e-6:
-                    grid_normal = cross_prod.normalized()
-                    # 确保局部法线方向与全局法线一致，防止网格折叠时法线翻转导致边界碰撞排斥力方向反转，造成网格崩塌
-                    if grid_normal.dot(normal_dir) < 0:
-                        grid_normal = -grid_normal
-                else:
-                    grid_normal = normal_dir.copy()
-                
-                # 获取直连邻居
                 n_left = curr_coords[u-1][v]
                 n_right = curr_coords[u+1][v]
                 n_bottom = curr_coords[u][v-1]
                 n_top = curr_coords[u][v+1]
-                
-                # A. 拉普拉斯平滑项：向直连邻居的几何中心靠近
-                pos_lap = (n_left + n_right + n_bottom + n_top) / 4.0
-                
-                # B. 弹簧力项（应用局部自适应弹簧长度约束）
-                force_spring = Vector((0.0, 0.0, 0.0))
-                
-                # 左直连弹簧力
-                diff = n_left - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += (length - target_u[u-1][v]) * (diff / length)
-                # 右直连弹簧力
-                diff = n_right - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += (length - target_u[u][v]) * (diff / length)
-                # 下直连弹簧力
-                diff = n_bottom - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += (length - target_v[u][v-1]) * (diff / length)
-                # 上直连弹簧力
-                diff = n_top - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += (length - target_v[u][v]) * (diff / length)
-                    
-                # 获取四个对角邻居
                 n_bottom_left = curr_coords[u-1][v-1]
                 n_top_right = curr_coords[u+1][v+1]
                 n_top_left = curr_coords[u-1][v+1]
                 n_bottom_right = curr_coords[u+1][v-1]
                 
-                # 对角弹簧力（抗剪切，权重 0.5）
-                # 左下角对角弹簧
-                diff = n_bottom_left - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += 0.5 * (length - target_diag[u-1][v-1]) * (diff / length)
-                # 右上角对角弹簧
-                diff = n_top_right - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += 0.5 * (length - target_diag[u][v]) * (diff / length)
-                # 左上角对角弹簧
-                diff = n_top_left - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += 0.5 * (length - target_diag[u-1][v]) * (diff / length)
-                # 右下角对角弹簧
-                diff = n_bottom_right - pos
-                length = diff.length
-                if length > 1e-6:
-                    force_spring += 0.5 * (length - target_diag[u][v-1]) * (diff / length)
+                pu = (n_right - n_left) * 0.5
+                pv = (n_top - n_bottom) * 0.5
+                puv = (n_top_right - n_top_left - n_bottom_right + n_bottom_left) * 0.25
+                
+                a2 = L0_U * L0_U + 1e-8
+                b2 = L0_V * L0_V + 1e-8
+                ab = L0_U * L0_V + 1e-8
+                
+                # 各向异性共形映射 (Anisotropic Winslow):
+                # 缩放度量张量以匹配物理边界的真实长宽比，彻底解决标准 Winslow 强行把长方形挤成正方形导致的网格畸变和部分区域过度宽大。
+                alpha = pv.dot(pv) / b2
+                beta = pu.dot(pv) / ab
+                gamma = pu.dot(pu) / a2
+                
+                denom = 2.0 * (alpha + gamma)
+                if denom > 1e-6:
+                    pos_winslow = (alpha * (n_right + n_left) + gamma * (n_top + n_bottom) - 2.0 * beta * puv) / denom
+                else:
+                    pos_winslow = (b2 * (n_right + n_left) + a2 * (n_top + n_bottom)) / (2.0 * (a2 + b2))
                     
-                pos_spring = pos + 0.25 * force_spring
+                # 动态安全检测 (Safety-Gated Laplacian): 
+                # 使用各向异性 Laplacian，使其也能完美契合用户的 M x N 比例。
+                pos_laplace = (b2 * (n_right + n_left) + a2 * (n_top + n_bottom)) / (2.0 * (a2 + b2))
                 
-                # 混合拉普拉斯和自适应弹簧力
-                relaxed_pos = pos.lerp(pos_lap, smooth_factor).lerp(pos_spring, spring_factor)
+                # 动态自适应弹簧：检测当前网格是否“过于宽松”
+                local_scale = ((n_right - n_left).length + (n_top - n_bottom).length) * 0.25
+                ideal_scale = (L0_U + L0_V) * 0.5
+                scale_ratio = local_scale / (ideal_scale + 1e-6)
                 
-                # C. Barycentric Restorative Pull using initial Coons Patch coordinates
-                # Bug3修复：提高投影阶段的拉回权重（0.03→0.08），避免内部顶点在表面高曲率处漂移；
-                # 同时移除错误的法线切向过滤——在弯曲表面上切掉法线分量反而会把点拉离表面。
-                pull_weight = 0.08 if should_project else 0.25
-                target_pos = initial_coords[u][v]
-                pull = target_pos - relaxed_pos
-                relaxed_pos = relaxed_pos + pull_weight * pull
+                # 对于过大的网格，激进地增加 Laplacian 权重以强行拉紧（使大网格收缩，进而拉开拥挤区域）
+                boosted_spring = spring_factor * (scale_ratio ** 1.5)
+                boosted_spring = min(0.95, max(spring_factor, boosted_spring))
+                
+                target_pos = pos_winslow.lerp(pos_laplace, boosted_spring)
+                
+                def get_min_j(p):
+                    j1 = (n_right - p).cross(n_top - p).dot(normal_dir)
+                    j2 = (n_top - p).cross(n_left - p).dot(normal_dir)
+                    j3 = (n_left - p).cross(n_bottom - p).dot(normal_dir)
+                    j4 = (n_bottom - p).cross(n_right - p).dot(normal_dir)
+                    return min(j1, j2, j3, j4)
+                    
+                mj_winslow = get_min_j(pos_winslow)
+                mj_target = get_min_j(target_pos)
+                
+                if mj_target > 1e-7:
+                    pos_mixed = target_pos
+                elif mj_winslow > 1e-7:
+                    half_target = pos_winslow.lerp(pos_laplace, spring_factor * 0.5)
+                    if get_min_j(half_target) > 1e-7:
+                        pos_mixed = half_target
+                    else:
+                        pos_mixed = pos_winslow
+                else:
+                    pos_mixed = pos_winslow
+                
+                relaxed_pos = pos.lerp(pos_mixed, 0.8)
 
-                # D. 贴合高模表面（使用双向射线投影 + 备用最近点贴合投影）
-                if should_project:
+                if should_project and sweep == inner_sweeps - 1:
                     try:
-                        world_pos = topo_world @ relaxed_pos  # Bug1: use relaxed_pos not old pos
+                        tangent_u = n_right - n_left
+                        tangent_v = n_top - n_bottom
+                        cross_prod = tangent_u.cross(tangent_v)
+                        if cross_prod.length > 1e-6:
+                            grid_normal = cross_prod.normalized()
+                            if grid_normal.dot(normal_dir) < 0:
+                                grid_normal = -grid_normal
+                        else:
+                            grid_normal = normal_dir.copy()
+                            
+                        world_pos = topo_world @ relaxed_pos
                         world_normal = (topo_world.to_3x3() @ grid_normal).normalized()
-                        
                         local_origin = matrix_inverse_ref @ world_pos
                         local_dir = (matrix_inverse_ref.to_3x3() @ world_normal).normalized()
                         
-                        # 在正反两个方向进行射线求交
                         success_f, loc_f, norm_f, idx_f = ref_obj.ray_cast(local_origin, local_dir)
                         success_b, loc_b, norm_b, idx_b = ref_obj.ray_cast(local_origin, -local_dir)
                         
                         max_ray_dist = max(M, N) * avg_boundary_len * 2.5
-                        
                         hit_pos = None
                         hit_normal = None
                         is_raycast = False
@@ -2035,14 +2065,13 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                         if success_f or success_b:
                             dist_f_topo = float('inf')
                             dist_b_topo = float('inf')
-                            
                             if success_f:
                                 topo_pos_f = topo_inverse @ (matrix_world_ref @ loc_f)
                                 dist_f_topo = (topo_pos_f - relaxed_pos).length
                             if success_b:
                                 topo_pos_b = topo_inverse @ (matrix_world_ref @ loc_b)
                                 dist_b_topo = (topo_pos_b - relaxed_pos).length
-                                
+                            
                             if dist_f_topo < dist_b_topo:
                                 if dist_f_topo < max_ray_dist:
                                     hit_pos = loc_f
@@ -2053,63 +2082,22 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                                     hit_pos = loc_b
                                     hit_normal = norm_b
                                     is_raycast = True
-                            
+                                    
                         if hit_pos is None:
-                            # 备用方案：寻找高模表面最近点
                             success_cp, loc_cp, norm_cp, idx_cp = ref_obj.closest_point_on_mesh(local_origin)
                             if success_cp:
                                 hit_pos = loc_cp
                                 hit_normal = norm_cp
                                 
                         if hit_pos is not None and hit_normal is not None:
-                            # 直接将命中点吸附到表面（偏移微小法线距离避免z-fighting）并转到topo空间
                             local_pt = hit_pos + hit_normal * 0.003
                             projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
-                            
-                            # 如果是通过射线投射找到的，直接采纳；如果是备用最近点，保留距离安全限制
                             if is_raycast or (projected_pos - relaxed_pos).length < max_ray_dist:
                                 relaxed_pos = projected_pos
                     except Exception:
                         pass
 
-                # E. 物理边界碰撞与安全守护 (Boundary Collision Guard)
-                # Bug4修复：使用预计算的面质心朝内方向（boundary_inwards_precomp），
-                # 而非每次用 grid_normal 叉积边切线临时计算——后者在三维曲面上可能方向翻转。
-                min_dist_sq = float('inf')
-                best_proj = None
-                best_inward = None
-                best_ab_len = 0.0
-                
-                for idx in range(len(boundary_loop)):
-                    p_curr = boundary_loop[idx]
-                    p_next = boundary_loop[(idx + 1) % len(boundary_loop)]
-                    
-                    AB = p_next - p_curr
-                    ab_len_sq = AB.length_squared
-                    if ab_len_sq < 1e-12:
-                        proj = p_curr.copy()
-                    else:
-                        t_param = (relaxed_pos - p_curr).dot(AB) / ab_len_sq
-                        t_param = max(0.0, min(1.0, t_param))
-                        proj = p_curr + t_param * AB
-                        
-                    dist_sq = (relaxed_pos - proj).length_squared
-                    if dist_sq < min_dist_sq:
-                        min_dist_sq = dist_sq
-                        best_proj = proj
-                        best_inward = boundary_inwards_precomp[idx]
-                        best_ab_len = math.sqrt(ab_len_sq)
-                        
-                # 设定防穿透自适应局部物理厚度保护
-                if best_proj is not None and best_inward is not None:
-                    local_margin = 0.15 * min(avg_boundary_len, best_ab_len)
-                    V_collision = relaxed_pos - best_proj
-                    dot_collision = V_collision.dot(best_inward)
-                    if dot_collision < local_margin:
-                        relaxed_pos = best_proj + best_inward * local_margin
-                        
                 grid_coords[u][v] = relaxed_pos
-
 
 class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
     bl_idname = "object.tp_topology_grid_fill"
@@ -2836,6 +2824,8 @@ def update_last_grid(context):
     # Update edit mesh and viewport
     bmesh.update_edit_mesh(topo_obj.data)
     context.area.tag_redraw()
+
+
 
 
 
