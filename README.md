@@ -11,5 +11,10 @@
 
 <img width="1728" height="926" alt="image" src="https://github.com/user-attachments/assets/51d18810-ebb7-4ca1-ae99-8f99bf3f5e38" />
 
+只需简单的绘制一个圈，就能有不错的拓扑效果。
+
+<img width="1522" height="816" alt="image" src="https://github.com/user-attachments/assets/a22ebb8b-7c21-4a37-b903-6ef84c063494" />
+
+<img width="1516" height="844" alt="image" src="https://github.com/user-attachments/assets/7a25c9fd-5c94-4705-8f91-a25c1cfc8173" />
 
 
