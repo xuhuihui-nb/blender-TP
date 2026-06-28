@@ -83,6 +83,11 @@ def register():
         default=False,
         update=op_draw.on_seam_edge_update
     )
+    bpy.types.Scene.tp_auto_grid_fill = bpy.props.BoolProperty(
+        name="自动填充栅格",
+        description="是否自动将绘制的闭合圈填充为栅格网格",
+        default=True
+    )
     bpy.types.Scene.tp_grid_span = bpy.props.IntProperty(
         name="跨分",
         description="栅格一边的网格数。0 表示自动计算",
@@ -125,6 +130,7 @@ def unregister():
     del bpy.types.Scene.tp_use_wrap
     del bpy.types.Scene.tp_pin_boundary
     del bpy.types.Scene.tp_seam_edge
+    del bpy.types.Scene.tp_auto_grid_fill
     del bpy.types.Scene.tp_grid_span
     del bpy.types.Scene.tp_grid_offset
     del bpy.types.Scene.tp_show_tutorial

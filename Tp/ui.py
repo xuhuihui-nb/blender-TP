@@ -72,6 +72,7 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
             
             col.separator()
             row2 = col.row(align=True)
+            row2.prop(scene, "tp_auto_grid_fill", text="栅格", toggle=True, icon='GRID')
             row2.operator(
                 "object.tp_topology_grid_fill",
                 text="栅格填充",

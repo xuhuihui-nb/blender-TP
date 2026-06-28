@@ -153,7 +153,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         except Exception:
             mod.wrap_mode = 'ON_SURFACE'
             
-        mod.offset = 0.003
+        mod.offset = 0.0005
         mod.show_in_editmode = True
         
         # 3. 关键选项：开启笼子显示，强制 Blender 编辑手柄(Gizmo)物理投射到高模表面，解决操作分离感
@@ -1148,7 +1148,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 success = False
                 
         if success:
-            local_pt = location + normal * 0.003
+            local_pt = location + normal * 0.0005
             world_pt = matrix_world @ local_pt
             return world_pt
             
@@ -1207,7 +1207,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     success_back = False
                     
             if success_back:
-                local_pt = loc_back + norm_back * 0.003
+                local_pt = loc_back + norm_back * 0.0005
                 world_pt = matrix_world @ local_pt
                 return world_pt
                 
@@ -1481,7 +1481,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 local_target = matrix_inverse @ world_co
                 success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
                 if success:
-                    local_pt = location + normal * 0.003
+                    local_pt = location + normal * 0.0005
                     v.co = topo_inverse @ (matrix_world @ local_pt)
             except Exception:
                 pass
@@ -1724,7 +1724,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                     local_target = ref_inverse @ pt_3d
                                     success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
                                     if success:
-                                        local_pt = location + normal * 0.003
+                                        local_pt = location + normal * 0.0005
                                         pt_3d = ref_matrix @ local_pt
                                 except:
                                     pass
@@ -1852,7 +1852,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                         local_target = ref_inverse @ new_pt
                         success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
                         if success:
-                            local_pt = location + normal * 0.003
+                            local_pt = location + normal * 0.0005
                             new_pt = ref_matrix @ local_pt
                     except Exception:
                         pass
@@ -2064,109 +2064,110 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             bmesh.update_edit_mesh(topo_obj.data)
 
             # Check if a closed loop is generated, and if so, perform grid fill immediately
-            from .op_grid_fill import analyze_selection, find_minimum_cycle_basis, trace_cycle_verts, check_is_grid_filled
-            
-            bm = bmesh.from_edit_mesh(topo_obj.data)
-            bm.verts.ensure_lookup_table()
-            bm.edges.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
-            
-            # Save original selection state (which is just the last vertex at this point)
-            orig_sel_verts = [v.index for v in bm.verts if v.select]
-            orig_sel_edges = [e.index for e in bm.edges if e.select]
-            orig_sel_faces = [f.index for f in bm.faces if f.select]
-            
-            # Select all vertices and edges of the newly created stroke to check if they form/part of a closed loop
-            for v in bm.verts:
-                v.select = (v.index in curr_indices)
-            for e in bm.edges:
-                e.select = (e.verts[0].index in curr_indices and e.verts[1].index in curr_indices)
-            try:
-                with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
-                    f_log.write(f"  [op_draw select] curr_indices: {curr_indices}\n")
-                    f_log.write(f"  [op_draw select] selected in bm: {[v.index for v in bm.verts if v.select]}\n")
-            except:
-                pass
-            # Analyze selection to see if it contains a valid unfilled closed loop
-            components, err_msg = analyze_selection(bm, is_auto=True)
-            try:
-                with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
-                    f_log.write(f"\n--- op_draw check: analyze_selection returned {len(components)} components, err_msg={err_msg} ---\n")
-                    for c_idx, c in enumerate(components):
-                        f_log.write(f"  Comp {c_idx}: type={c['type']}, verts={len(c['vert_indices'])}, is_grid_filled={c['is_grid_filled']}\n")
-            except:
-                pass
-            
-            has_valid_unfilled_loop = False
-            if components and not err_msg:
-                for comp in components:
-                    if comp['type'] in {'loop', 'non_linear_loops'} and not comp.get('is_grid_filled', False):
-                        if context.scene.tp_use_fixed_point_count:
-                            if comp['type'] == 'loop':
-                                num_points = len(comp['vert_indices'])
-                                if num_points % 4 != 0:
-                                    continue
-                            elif comp['type'] == 'non_linear_loops':
-                                raw_cycles = find_minimum_cycle_basis(bm, comp['verts'], comp['edges'])
-                                if raw_cycles:
-                                    all_cycles_valid = True
-                                    for c in raw_cycles:
-                                        cycle_verts = trace_cycle_verts(c)
-                                        if not check_is_grid_filled(bm, cycle_verts, c):
-                                            if len(cycle_verts) % 4 != 0:
-                                                all_cycles_valid = False
-                                                break
-                                    if not all_cycles_valid:
-                                        continue
-                                else:
-                                    continue
-                        has_valid_unfilled_loop = True
-                        break
-            
-            if not getattr(self, 'prevent_auto_grid_fill', False) and has_valid_unfilled_loop:
-                # We have a valid unfilled closed loop!
-                # Keep the selection of the new stroke vertices, so the grid fill operator knows what to fill
-                bmesh.update_edit_mesh(topo_obj.data)
+            if context.scene.tp_auto_grid_fill:
+                from .op_grid_fill import analyze_selection, find_minimum_cycle_basis, trace_cycle_verts, check_is_grid_filled
                 
-                # Run the grid fill operator
-                try:
-                    bpy.ops.object.tp_topology_grid_fill(is_auto=True)
-                except Exception as e:
-                    import traceback
-                    tb_str = traceback.format_exc()
-                    try:
-                        with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_err:
-                            f_err.write("--- Auto grid fill error ---\n" + tb_str + "\n")
-                    except:
-                        pass
-                    print("Auto grid fill error:", e)
-                
-                # After grid fill, restore to only selecting the last vertex of the stroke if it exists and is valid
                 bm = bmesh.from_edit_mesh(topo_obj.data)
                 bm.verts.ensure_lookup_table()
-                for v in bm.verts:
-                    v.select = False
-                for e in bm.edges:
-                    e.select = False
-                for f in bm.faces:
-                    f.select = False
+                bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
                 
-                if last_idx < len(bm.verts):
-                    last_v = bm.verts[last_idx]
-                    if last_v.is_valid:
-                        last_v.select = True
-                        bm.select_history.clear()
-                        bm.select_history.add(last_v)
-                bmesh.update_edit_mesh(topo_obj.data)
-            else:
-                # No closed loop was formed, restore the selection (the last vertex)
+                # Save original selection state (which is just the last vertex at this point)
+                orig_sel_verts = [v.index for v in bm.verts if v.select]
+                orig_sel_edges = [e.index for e in bm.edges if e.select]
+                orig_sel_faces = [f.index for f in bm.faces if f.select]
+                
+                # Select all vertices and edges of the newly created stroke to check if they form/part of a closed loop
                 for v in bm.verts:
-                    v.select = (v.index in orig_sel_verts)
+                    v.select = (v.index in curr_indices)
                 for e in bm.edges:
-                    e.select = (e.index in orig_sel_edges)
-                for f in bm.faces:
-                    f.select = (f.index in orig_sel_faces)
-                bmesh.update_edit_mesh(topo_obj.data)
+                    e.select = (e.verts[0].index in curr_indices and e.verts[1].index in curr_indices)
+                try:
+                    with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                        f_log.write(f"  [op_draw select] curr_indices: {curr_indices}\n")
+                        f_log.write(f"  [op_draw select] selected in bm: {[v.index for v in bm.verts if v.select]}\n")
+                except:
+                    pass
+                # Analyze selection to see if it contains a valid unfilled closed loop
+                components, err_msg = analyze_selection(bm, is_auto=True)
+                try:
+                    with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                        f_log.write(f"\n--- op_draw check: analyze_selection returned {len(components)} components, err_msg={err_msg} ---\n")
+                        for c_idx, c in enumerate(components):
+                            f_log.write(f"  Comp {c_idx}: type={c['type']}, verts={len(c['vert_indices'])}, is_grid_filled={c['is_grid_filled']}\n")
+                except:
+                    pass
+                
+                has_valid_unfilled_loop = False
+                if components and not err_msg:
+                    for comp in components:
+                        if comp['type'] in {'loop', 'non_linear_loops'} and not comp.get('is_grid_filled', False):
+                            if context.scene.tp_use_fixed_point_count:
+                                if comp['type'] == 'loop':
+                                    num_points = len(comp['vert_indices'])
+                                    if num_points % 4 != 0:
+                                        continue
+                                elif comp['type'] == 'non_linear_loops':
+                                    raw_cycles = find_minimum_cycle_basis(bm, comp['verts'], comp['edges'])
+                                    if raw_cycles:
+                                        all_cycles_valid = True
+                                        for c in raw_cycles:
+                                            cycle_verts = trace_cycle_verts(c)
+                                            if not check_is_grid_filled(bm, cycle_verts, c):
+                                                if len(cycle_verts) % 4 != 0:
+                                                    all_cycles_valid = False
+                                                    break
+                                        if not all_cycles_valid:
+                                            continue
+                                    else:
+                                        continue
+                            has_valid_unfilled_loop = True
+                            break
+                
+                if not getattr(self, 'prevent_auto_grid_fill', False) and has_valid_unfilled_loop:
+                    # We have a valid unfilled closed loop!
+                    # Keep the selection of the new stroke vertices, so the grid fill operator knows what to fill
+                    bmesh.update_edit_mesh(topo_obj.data)
+                    
+                    # Run the grid fill operator
+                    try:
+                        bpy.ops.object.tp_topology_grid_fill(is_auto=True)
+                    except Exception as e:
+                        import traceback
+                        tb_str = traceback.format_exc()
+                        try:
+                            with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_err:
+                                f_err.write("--- Auto grid fill error ---\n" + tb_str + "\n")
+                        except:
+                            pass
+                        print("Auto grid fill error:", e)
+                    
+                    # After grid fill, restore to only selecting the last vertex of the stroke if it exists and is valid
+                    bm = bmesh.from_edit_mesh(topo_obj.data)
+                    bm.verts.ensure_lookup_table()
+                    for v in bm.verts:
+                        v.select = False
+                    for e in bm.edges:
+                        e.select = False
+                    for f in bm.faces:
+                        f.select = False
+                    
+                    if last_idx < len(bm.verts):
+                        last_v = bm.verts[last_idx]
+                        if last_v.is_valid:
+                            last_v.select = True
+                            bm.select_history.clear()
+                            bm.select_history.add(last_v)
+                    bmesh.update_edit_mesh(topo_obj.data)
+                else:
+                    # No closed loop was formed, restore the selection (the last vertex)
+                    for v in bm.verts:
+                        v.select = (v.index in orig_sel_verts)
+                    for e in bm.edges:
+                        e.select = (e.index in orig_sel_edges)
+                    for f in bm.faces:
+                        f.select = (f.index in orig_sel_faces)
+                    bmesh.update_edit_mesh(topo_obj.data)
 
     def create_outside_drag_geometry(self, context, start_2d, end_2d):
         import math
@@ -2215,10 +2216,10 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 loc_front, norm_front, _ = hits_local[2*k]
                 loc_back, norm_back, _ = hits_local[2*k + 1]
                 
-                local_pt_front = loc_front + norm_front * 0.003
+                local_pt_front = loc_front + norm_front * 0.0005
                 world_pt_front = matrix_world @ local_pt_front
                 
-                local_pt_back = loc_back + norm_back * 0.003
+                local_pt_back = loc_back + norm_back * 0.0005
                 world_pt_back = matrix_world @ local_pt_back
                 
                 # 计算相机空间深度（沿着视线方向的投影距离）
@@ -2379,7 +2380,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             local_target = matrix_inverse @ p_new
                             success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
                             if success:
-                                local_pt = location + normal * 0.003
+                                local_pt = location + normal * 0.0005
                                 p_new = matrix_world @ local_pt
                         except Exception:
                             pass
@@ -3259,7 +3260,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             local_target = ref_inverse @ world_co
                             success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
                             if success:
-                                local_pt = location + normal * 0.003
+                                local_pt = location + normal * 0.0005
                                 v.co = inv_topo_matrix @ (ref_matrix @ local_pt)
                         except Exception:
                             pass
@@ -3277,7 +3278,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     local_target = ref_inverse @ world_co
                     success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
                     if success:
-                        local_pt = location + normal * 0.003
+                        local_pt = location + normal * 0.0005
                         active_projected_world = ref_matrix @ local_pt
                     else:
                         active_projected_world = world_co

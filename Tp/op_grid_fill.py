@@ -1186,7 +1186,7 @@ def global_optimize_spliced_grids(bm, ref_obj, topo_obj, iterations=40, spring_f
                             success_snap, location_snap, normal_snap, index_snap = ref_obj.closest_point_on_mesh(local_target_tangent)
                             
                             if success_snap:
-                                local_pt = location_snap + normal_snap * 0.003
+                                local_pt = location_snap + normal_snap * 0.0005
                                 projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
                                 
                                 if is_raycast or (projected_pos - relaxed_pos).length < max_ray_dist:
@@ -2101,7 +2101,7 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
                                 hit_normal = norm_cp
                                 
                         if hit_pos is not None and hit_normal is not None:
-                            local_pt = hit_pos + hit_normal * 0.003
+                            local_pt = hit_pos + hit_normal * 0.0005
                             projected_pos = topo_inverse @ (matrix_world_ref @ local_pt)
                             if is_raycast or (projected_pos - relaxed_pos).length < max_ray_dist:
                                 relaxed_pos = projected_pos
