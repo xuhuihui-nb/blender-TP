@@ -3366,6 +3366,17 @@ def update_pinned_coordinates(context):
                     _pinned_coords[i] = mathutils.Vector(co_attr.data[i].vector)
         _pinned_vertex_count = len(mesh.vertices)
 
+def get_pin_target_verts(bm):
+    """
+    Returns the set of vertices that represent the boundaries of all loops
+    (including outer boundaries and internal stitched borders of rasterized loops).
+    """
+    target_verts = set()
+    target_edges = get_seam_target_edges(bm)
+    for e in target_edges:
+        target_verts.update(e.verts)
+    return target_verts
+
 def on_pin_boundary_update(self, context):
     """
     Callback triggered whenever context.scene.tp_pin_boundary is toggled.
@@ -3400,9 +3411,10 @@ def on_pin_boundary_update(self, context):
         co_layer = bm.verts.layers.float_vector.get("tp_pinned_co") or bm.verts.layers.float_vector.new("tp_pinned_co")
         
         if not selected_indices:
-            # Case A: No points selected - set/clear all boundary vertices
+            # Case A: No points selected - set/clear all boundary vertices of loops
+            target_verts = get_pin_target_verts(bm)
             for v in bm.verts:
-                if v.is_boundary:
+                if v in target_verts:
                     v[pin_layer] = 1 if pin_active else 0
                     v[co_layer] = v.co.copy()
                 else:
@@ -3426,12 +3438,15 @@ def on_pin_boundary_update(self, context):
         
         if not selected_indices:
             # Case A: No points selected
+            target_verts = get_pin_target_verts(bm)
+            target_indices = {v.index for v in target_verts}
             for v in bm.verts:
-                if v.is_boundary:
-                    pin_attr.data[v.index].value = 1 if pin_active else 0
-                    co_attr.data[v.index].vector = v.co.copy()
+                idx = v.index
+                if idx in target_indices:
+                    pin_attr.data[idx].value = 1 if pin_active else 0
+                    co_attr.data[idx].vector = v.co.copy()
                 else:
-                    pin_attr.data[v.index].value = 0
+                    pin_attr.data[idx].value = 0
         else:
             # Case B: Points selected
             for idx in selected_indices:
@@ -3454,6 +3469,116 @@ def on_pin_boundary_update(self, context):
             if idx < len(mask_attr.data):
                 mask_attr.data[idx].value = 1.0
         mesh.update()
+
+def get_seam_target_edges(bm):
+    """
+    Returns the set of edges that represent the borders of all loops
+    (including outer boundaries and internal stitched borders of rasterized loops).
+    """
+    target_edges = set()
+    
+    # 1. Wire edges (edges with no faces)
+    for e in bm.edges:
+        if len(e.link_faces) == 0:
+            target_edges.add(e)
+            
+    # 2. Rasterized loop boundaries
+    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+    if grid_layer:
+        # Group faces by loop_id
+        faces_by_lid = {}
+        for f in bm.faces:
+            lid = f[grid_layer]
+            if lid > 0:
+                faces_by_lid.setdefault(lid, []).append(f)
+                
+        # For each loop, find its boundary edges
+        for lid, faces in faces_by_lid.items():
+            edges_of_lid = set()
+            for f in faces:
+                edges_of_lid.update(f.edges)
+            for e in edges_of_lid:
+                faces_sharing = [f for f in e.link_faces if f[grid_layer] == lid]
+                if len(faces_sharing) == 1:
+                    target_edges.add(e)
+                    
+    # 3. Standard boundary edges of the mesh
+    for e in bm.edges:
+        if e.is_boundary:
+            target_edges.add(e)
+            
+    return target_edges
+
+def on_seam_edge_update(self, context):
+    """
+    Callback triggered whenever context.scene.tp_seam_edge is toggled.
+    Marks/clears edge seams on loop boundary edges (if no edges are selected) or selected edges.
+    """
+    global _updating_ui
+    if _updating_ui:
+        return
+        
+    topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+    if not topo_obj:
+        return
+        
+    seam_active = context.scene.tp_seam_edge
+    import bmesh
+    is_edit = (topo_obj.mode == 'EDIT')
+    
+    # Get selected edges
+    selected_indices = []
+    if is_edit:
+        bm = bmesh.from_edit_mesh(topo_obj.data)
+        bm.edges.ensure_lookup_table()
+        selected_indices = [e.index for e in bm.edges if e.select]
+    else:
+        selected_indices = [e.index for e in topo_obj.data.edges if e.select]
+        
+    # Modify seam property
+    if is_edit:
+        bm = bmesh.from_edit_mesh(topo_obj.data)
+        bm.edges.ensure_lookup_table()
+        
+        if not selected_indices:
+            # Case A: No edges selected - set/clear all loop boundaries
+            target_edges = get_seam_target_edges(bm)
+            for e in bm.edges:
+                if e in target_edges:
+                    e.seam = seam_active
+                else:
+                    e.seam = False
+        else:
+            # Case B: Edges selected - set/clear selected edges only
+            for idx in selected_indices:
+                if idx < len(bm.edges):
+                    bm.edges[idx].seam = seam_active
+        bmesh.update_edit_mesh(topo_obj.data)
+    else:
+        mesh = topo_obj.data
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bm.edges.ensure_lookup_table()
+        
+        if not selected_indices:
+            # Case A: No edges selected
+            target_edges = get_seam_target_edges(bm)
+            target_indices = {e.index for e in target_edges}
+            for e in bm.edges:
+                idx = e.index
+                if idx < len(mesh.edges):
+                    mesh.edges[idx].use_seam = (idx in target_indices) and seam_active
+        else:
+            # Case B: Edges selected
+            for idx in selected_indices:
+                if idx < len(mesh.edges):
+                    mesh.edges[idx].use_seam = seam_active
+        bm.free()
+        mesh.update()
+        
+    # Trigger viewport redraw
+    if context.area:
+        context.area.tag_redraw()
 
 def tp_pin_depsgraph_handler(scene, depsgraph=None):
     """
@@ -3489,9 +3614,9 @@ def tp_pin_depsgraph_handler(scene, depsgraph=None):
             else:
                 pin_layer = bm.verts.layers.int.get("tp_is_pinned")
                 if pin_layer:
-                    boundary_verts = [v for v in bm.verts if v.is_boundary]
-                    if boundary_verts:
-                        is_pinned = all(v[pin_layer] == 1 for v in boundary_verts)
+                    target_verts = get_pin_target_verts(bm)
+                    if target_verts:
+                        is_pinned = all(v[pin_layer] == 1 for v in target_verts)
         except Exception:
             pass
     else:
@@ -3507,15 +3632,63 @@ def tp_pin_depsgraph_handler(scene, depsgraph=None):
                 bm = bmesh.new()
                 bm.from_mesh(mesh)
                 bm.verts.ensure_lookup_table()
-                boundary_indices = [v.index for v in bm.verts if v.is_boundary]
+                target_verts = get_pin_target_verts(bm)
+                target_indices = {v.index for v in target_verts}
                 bm.free()
-                if boundary_indices:
-                    is_pinned = all(pin_attr.data[idx].value == 1 for idx in boundary_indices)
+                if target_indices:
+                    is_pinned = all(pin_attr.data[idx].value == 1 for idx in target_indices)
                     
     if scene.tp_pin_boundary != is_pinned:
         _updating_ui = True
         try:
             scene.tp_pin_boundary = is_pinned
+        finally:
+            _updating_ui = False
+
+    # --- Seam Edge UI State Synchronization ---
+    is_seam = False
+    if is_edit:
+        try:
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            selected_edges = [e for e in bm.edges if e.select]
+            if selected_edges:
+                active_e = bm.select_history.active
+                if active_e and isinstance(active_e, bmesh.types.BMEdge) and active_e.select:
+                    target_e = active_e
+                else:
+                    target_e = selected_edges[0]
+                if target_e.seam:
+                    is_seam = True
+            else:
+                target_edges = get_seam_target_edges(bm)
+                if target_edges:
+                    is_seam = all(e.seam for e in target_edges)
+        except Exception:
+            pass
+    else:
+        try:
+            mesh = topo_obj.data
+            selected_edges = [e for e in mesh.edges if e.select]
+            if selected_edges:
+                target_e = selected_edges[0]
+                if target_e.use_seam:
+                    is_seam = True
+            else:
+                bm = bmesh.new()
+                bm.from_mesh(mesh)
+                bm.edges.ensure_lookup_table()
+                target_edges = get_seam_target_edges(bm)
+                target_indices = {e.index for e in target_edges}
+                bm.free()
+                if target_indices:
+                    is_seam = all(mesh.edges[idx].use_seam for idx in target_indices)
+        except Exception:
+            pass
+            
+    if scene.tp_seam_edge != is_seam:
+        _updating_ui = True
+        try:
+            scene.tp_seam_edge = is_seam
         finally:
             _updating_ui = False
             

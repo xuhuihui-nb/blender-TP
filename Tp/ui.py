@@ -45,6 +45,7 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                 row_front.prop(topo_obj, "show_in_front", text="最前显示", toggle=True, icon='AXIS_FRONT')
                 row_front.prop(scene, "tp_use_wrap", text="包裹", toggle=True, icon='MOD_SHRINKWRAP')
                 row_front.prop(scene, "tp_pin_boundary", text="固定", toggle=True, icon='PINNED')
+                row_front.prop(scene, "tp_seam_edge", text="缝合边", toggle=True, icon='EDGE_SEAM')
             
             col.separator()
             col.prop(scene, "tp_edge_length", text="边长")
