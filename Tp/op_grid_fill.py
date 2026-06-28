@@ -226,10 +226,10 @@ def analyze_selection(bm, is_auto=False):
                     'vert_indices': [],
                     'is_grid_filled': False
                 })
-            elif len(loop_verts) < 8:
+            elif len(loop_verts) < 4:
                 parsed_components.append({
                     'type': 'invalid',
-                    'err': f"选中的循环边顶点数太少（当前为 {len(loop_verts)}），栅格填充至少需要 8 个顶点。",
+                    'err': f"选中的循环边顶点数太少（当前为 {len(loop_verts)}），栅格填充至少需要 4 个顶点。",
                     'vert_indices': [],
                     'is_grid_filled': False
                 })
@@ -1402,7 +1402,18 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor
         loop_verts = cycles_verts[idx]
         L = len(loop_verts)
         
-        M, N, offset = params_map[idx]
+        params = params_map[idx]
+        if params is None:
+            best_params = find_best_corners_3d(loop_verts, ref_obj=ref_obj, topo_obj=topo_obj)
+            if best_params:
+                M, N, offset = best_params
+            else:
+                half_L = L // 2
+                N = max(1, half_L // 2)
+                M = half_L - N
+                offset = 0
+        else:
+            M, N, offset = params
         
         # 检查该子圈是否涉及任何固定或共享边界约束。如果有，则不允许用户通过 slider 强行覆盖参数，以保全缝合拓扑。
         k_mapped = active_indices.index(idx)
@@ -1415,7 +1426,7 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor
         if not has_constraints:
             if user_span >= 2:
                 half_L = L // 2
-                N = max(2, min(half_L - 2, user_span))
+                N = max(1, min(half_L - 1, user_span))
                 M = half_L - N
             offset = (offset + user_offset) % L
         
@@ -2292,7 +2303,7 @@ class OBJECT_OT_tp_topology_grid_fill(bpy.types.Operator):
                 if not has_fixed:
                     if self.span >= 2:
                         half_L = L // 2
-                        N = max(2, min(half_L - 2, self.span))
+                        N = max(1, min(half_L - 1, self.span))
                         M = half_L - N
                     offset = (offset + self.offset) % L
                 
@@ -2735,7 +2746,7 @@ def update_last_grid(context):
         if not has_constraints:
             if user_span >= 2:
                 half_L = L // 2
-                N = max(2, min(half_L - 2, user_span))
+                N = max(1, min(half_L - 1, user_span))
                 M = half_L - N
             offset = (offset + user_offset) % L
             
