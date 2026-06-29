@@ -48,7 +48,7 @@ def register():
     bpy.types.Scene.tp_edge_length = bpy.props.FloatProperty(
         name="边长",
         description="控制绘制时的目标点间距",
-        default=0.05,
+        default=0.1,
         min=0.005,
         max=10.0,
         precision=3,
@@ -70,6 +70,20 @@ def register():
         name="包裹",
         description="拓扑时自动吸附并使用收缩包裹贴合表面",
         default=True
+    )
+    bpy.types.Scene.tp_boundary_mode = bpy.props.BoolProperty(
+        name="边界",
+        description="显示白边外圈并允许拖拽调整栅格",
+        default=True
+    )
+    bpy.types.Scene.tp_smooth_strength = bpy.props.FloatProperty(
+        name="平滑力度",
+        description="控制边界平滑笔刷的力度",
+        default=0.2,
+        min=0.01,
+        max=1.0,
+        precision=2,
+        step=5
     )
     bpy.types.Scene.tp_pin_boundary = bpy.props.BoolProperty(
         name="固定",
@@ -99,7 +113,7 @@ def register():
         name="偏移",
         description="网格顶点的起点偏移量",
         default=0,
-        min=-100000,
+        min=0,
         max=100000,
         update=op_grid_fill.on_grid_settings_update
     )
@@ -128,6 +142,8 @@ def unregister():
     del bpy.types.Scene.tp_use_fixed_point_count
     del bpy.types.Scene.tp_fixed_point_count
     del bpy.types.Scene.tp_use_wrap
+    del bpy.types.Scene.tp_boundary_mode
+    del bpy.types.Scene.tp_smooth_strength
     del bpy.types.Scene.tp_pin_boundary
     del bpy.types.Scene.tp_seam_edge
     del bpy.types.Scene.tp_auto_grid_fill

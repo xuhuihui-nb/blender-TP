@@ -27,6 +27,38 @@ def get_shader_2d():
         except Exception:
             return None
 
+def get_seam_target_edges_local(bm):
+    target_edges = set()
+    # 1. Wire edges (edges with no faces)
+    for e in bm.edges:
+        if len(e.link_faces) == 0:
+            target_edges.add(e)
+            
+    # 2. Rasterized loop boundaries
+    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+    if grid_layer:
+        faces_by_lid = {}
+        for f in bm.faces:
+            lid = f[grid_layer]
+            if lid > 0:
+                faces_by_lid.setdefault(lid, []).append(f)
+                
+        for lid, faces in faces_by_lid.items():
+            edges_of_lid = set()
+            for f in faces:
+                edges_of_lid.update(f.edges)
+            for e in edges_of_lid:
+                faces_sharing = [f for f in e.link_faces if f[grid_layer] == lid]
+                if len(faces_sharing) == 1:
+                    target_edges.add(e)
+                    
+    # 3. Standard boundary edges of the mesh
+    for e in bm.edges:
+        if e.is_boundary:
+            target_edges.add(e)
+            
+    return target_edges
+
 def draw_callback(self, context):
     # 1. Draw the active stroke line strip in real-time using resampled points
     if self.stroke_points and len(self.stroke_points) >= 2:
@@ -130,9 +162,19 @@ def draw_callback(self, context):
             
             shader = get_shader()
             if shader and (pinned_coords or pinned_edges):
+                orig_depth_test = 'NONE'
+                try:
+                    orig_depth_test = gpu.state.depth_test_get()
+                    if topo_obj.show_in_front:
+                        gpu.state.depth_test_set('NONE')
+                    else:
+                        gpu.state.depth_test_set('LESS_EQUAL')
+                except Exception:
+                    pass
+
                 shader.bind()
-                # Pure White color: (1.0, 1.0, 1.0, 1.0)
-                shader.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
+                # Yellow color: (1.0, 0.9, 0.0, 1.0)
+                shader.uniform_float("color", (1.0, 0.9, 0.0, 1.0))
                 
                 # 1. Always draw edges (lines) if they exist
                 if pinned_edges:
@@ -162,7 +204,105 @@ def draw_callback(self, context):
                     except Exception:
                         pass
 
+                # Restore original depth test state
+                try:
+                    gpu.state.depth_test_set(orig_depth_test)
+                except Exception:
+                    pass
+
+    # 4. Draw boundary edges overlay (white edges) in boundary mode
+    if getattr(context.scene, "tp_boundary_mode", True):
+        topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+        if topo_obj and topo_obj.type == 'MESH':
+            boundary_edges = []
+            matrix_world = topo_obj.matrix_world
+            is_edit = (topo_obj.mode == 'EDIT')
+            
+            if is_edit:
+                try:
+                    bm = bmesh.from_edit_mesh(topo_obj.data)
+                    target_edges = get_seam_target_edges_local(bm)
+                    for e in target_edges:
+                        boundary_edges.append((matrix_world @ e.verts[0].co, matrix_world @ e.verts[1].co))
+                except Exception as e:
+                    print("Error getting edit mesh boundary edges:", e)
+            else:
+                try:
+                    mesh = topo_obj.data
+                    bm = bmesh.new()
+                    bm.from_mesh(mesh)
+                    target_edges = get_seam_target_edges_local(bm)
+                    for e in target_edges:
+                        boundary_edges.append((matrix_world @ e.verts[0].co, matrix_world @ e.verts[1].co))
+                    bm.free()
+                except Exception as e:
+                    print("Error getting mesh boundary edges:", e)
+            
+            shader = get_shader()
+            if shader and boundary_edges:
+                orig_depth_test = 'NONE'
+                try:
+                    orig_depth_test = gpu.state.depth_test_get()
+                    if topo_obj.show_in_front:
+                        gpu.state.depth_test_set('NONE')
+                    else:
+                        gpu.state.depth_test_set('LESS_EQUAL')
+                except Exception:
+                    pass
+
+                shader.bind()
+                # Pure White color: (1.0, 1.0, 1.0, 1.0)
+                shader.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
+                try:
+                    gpu.state.line_width_set(4.0)
+                except Exception:
+                    pass
+                coords = []
+                for p1, p2 in boundary_edges:
+                    coords.append(tuple(p1))
+                    coords.append(tuple(p2))
+                try:
+                    batch_boundary_edges = batch_for_shader(shader, 'LINES', {"pos": coords})
+                    batch_boundary_edges.draw(shader)
+                except Exception as e:
+                    print("Error drawing boundary edges:", e)
+                finally:
+                    # Restore original depth test state
+                    try:
+                        gpu.state.depth_test_set(orig_depth_test)
+                    except Exception:
+                        pass
+
 def draw_text_callback(self, context):
+    # 0. Draw boundary smoothing brush indicator
+    is_boundary_mode = getattr(context.scene, "tp_boundary_mode", True)
+    alt_held = getattr(self, 'alt_pressed', False)
+    if getattr(self, 'is_smoothing', False) or (is_boundary_mode and alt_held):
+        cx, cy = self.last_mouse_coord[0], self.last_mouse_coord[1]
+        shader = get_shader_2d()
+        if shader:
+            shader.bind()
+            radius = getattr(self, 'smooth_brush_radius', 50.0)
+            num_segments = 32
+            
+            # White color: (1.0, 1.0, 1.0, 1.0)
+            shader.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
+            
+            circle_coords = []
+            for i in range(num_segments + 1):
+                theta = 2.0 * math.pi * i / num_segments
+                circle_coords.append((cx + radius * math.cos(theta), cy + radius * math.sin(theta)))
+            
+            try:
+                gpu.state.line_width_set(4.0)
+            except Exception:
+                pass
+            try:
+                batch_circle = batch_for_shader(shader, 'LINE_STRIP', {"pos": circle_coords})
+                batch_circle.draw(shader)
+            except Exception:
+                pass
+
     # 1. Draw hover snap point indicator
     if self.hover_snap_pt:
         region = context.region

@@ -42,10 +42,13 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
             if topo_obj:
                 col.separator()
                 row_front = col.row(align=True)
+                row_front.prop(scene, "tp_boundary_mode", text="边界", toggle=True, icon='EDGESEL')
                 row_front.prop(topo_obj, "show_in_front", text="最前显示", toggle=True, icon='AXIS_FRONT')
                 row_front.prop(scene, "tp_use_wrap", text="包裹", toggle=True, icon='MOD_SHRINKWRAP')
                 row_front.prop(scene, "tp_pin_boundary", text="固定", toggle=True, icon='PINNED')
                 row_front.prop(scene, "tp_seam_edge", text="缝合边", toggle=True, icon='EDGE_SEAM')
+                if scene.tp_boundary_mode:
+                    col.prop(scene, "tp_smooth_strength", text="平滑力度")
             
             col.separator()
             col.prop(scene, "tp_edge_length", text="边长")
@@ -126,10 +129,17 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                     col_t.label(text="• 锁定边界: 开启【固定】可锁定边界顶点；若选点则仅锁定选中点")
                     
                     col_t.separator()
+                    col_t.label(text="【边界交互 (白线)】", icon='EDGESEL')
+                    col_t.label(text="• 边界拖动: 【边界】模式下，左键直接在白线顶点/边附近拖动可实时改变边界")
+                    col_t.label(text="• 边界平滑: 【边界】模式下，按住 Alt + 左键拖动，可用圆形笔刷实时平滑白线")
+                    col_t.label(text="• 元素隔离: 【边界】模式下，内部栅格元素将不可选，防止意外选中或误操作")
+                    col_t.label(text="• 安全吸附: 边界点吸附时，只吸附白线顶点，且防止鼠标穿透网格吸附到背面")
+                    
+                    col_t.separator()
                     col_t.label(text="【编辑与调整】", icon='GRIP')
-                    col_t.label(text="• 循环边选择: Alt + 左键点击顶点/边 (多次点击可切换候选路径)")
-                    col_t.label(text="• 顶点微调: 点附近按 G 键直接移动，或选中后按 G 键 (右键/ESC取消)")
-                    col_t.label(text="• 循环细分: 选中边/圈或已填栅格，Ctrl + 滚轮可实时调整密度")
+                    col_t.label(text="• 循环边选择: Alt + 左键点击顶点/边 (多次点击切换候选路径，Shift+Alt可加选)")
+                    col_t.label(text="• 顶点微调: 点附近按 G 键直接移动，或选中后按 G 键 (右键/ESC取消，LMB/Enter确认)")
+                    col_t.label(text="• 循环细分: 选中边/圈或已填栅格，Ctrl + 滚轮可实时调整密度且保持网格形状稳定")
                     
                     col_t.separator()
                     col_t.label(text="【栅格填充微调】", icon='GRID')
@@ -159,10 +169,17 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                     col_t.label(text="• Lock Boundary: Enable [Pin] to lock boundary vertices; if vertices are selected, only locks selected vertices")
                     
                     col_t.separator()
+                    col_t.label(text="【Boundary Interaction (White Lines)】", icon='EDGESEL')
+                    col_t.label(text="• Drag Boundary: Under [Boundary] mode, drag LMB near white boundary vertices/edges to adjust boundary shape")
+                    col_t.label(text="• Smooth Boundary: Under [Boundary] mode, hold Alt + drag LMB to smooth white lines using a circular brush")
+                    col_t.label(text="• Element Isolation: Under [Boundary] mode, internal grid elements are locked/unselectable to prevent errors")
+                    col_t.label(text="• Safe Snapping: Snaps only to other boundary vertices, preventing cursor from penetrating the mesh")
+                    
+                    col_t.separator()
                     col_t.label(text="【Edit & Adjust】", icon='GRIP')
-                    col_t.label(text="• Edge Loop Select: Alt + click LMB on vertex/edge (click repeatedly to cycle through candidate paths)")
-                    col_t.label(text="• Tweak Vertex: Press G near a vertex to move it directly, or press G after selecting (RMB/ESC to cancel)")
-                    col_t.label(text="• Loop Subdivide: Select edge/loop/grid, Ctrl + Scroll Wheel to adjust density in real-time")
+                    col_t.label(text="• Edge Loop Select: Alt + click LMB on vertex/edge (click repeatedly to cycle paths, Shift+Alt to add)")
+                    col_t.label(text="• Tweak Vertex: Press G near a vertex to move it directly, or press G after selecting (RMB/ESC to cancel, LMB/Enter to confirm)")
+                    col_t.label(text="• Loop Subdivide: Select edge/loop/grid, Ctrl + Scroll Wheel to adjust density dynamically with stable shape")
                     
                     col_t.separator()
                     col_t.label(text="【Grid Fill Adjustment】", icon='GRID')

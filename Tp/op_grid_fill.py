@@ -1806,7 +1806,7 @@ def init_coons_grid(loop_verts, M, N, offset):
     return grid_coords
 
 
-def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_factor=0.3):
+def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_factor=0.3, is_interactive=False):
     """
     閲嶅啓鐗堬細鍚屼鸡杩炵画娉?(Homotopy) + Winslow 鍏卞舰骞虫粦銆?    淇浜嗘柟鍚戠炕杞鑷磋帿姣斾箤鏂壄缁撶殑鑷村懡婕忔礊锛?    """
     from mathutils import Vector
@@ -1863,7 +1863,7 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
     L0_U = len_u / (2.0 * max(M, 1))
     L0_V = len_v / (2.0 * max(N, 1))
 
-    morph_steps = 600
+    morph_steps = 100 if is_interactive else 600
     loop_sequence = [ [v.copy() for v in target_loop] ]
     current_bnd = loop_sequence[0]
     
@@ -1948,10 +1948,16 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
         matrix_world_ref = None
 
     # 强制增加迭代次数以保证动态平衡
-    total_iters = max(iterations, 300)
-    pre_smooth_iters = 50   # 初始凸包预平滑
-    morph_iters = int((total_iters - pre_smooth_iters) * 0.6)
-    proj_iters = total_iters - int(total_iters * 0.15)
+    if is_interactive:
+        total_iters = iterations
+        pre_smooth_iters = 0
+        morph_iters = iterations
+        proj_iters = 999999
+    else:
+        total_iters = max(iterations, 300)
+        pre_smooth_iters = 50   # 初始凸包预平滑
+        morph_iters = int((total_iters - pre_smooth_iters) * 0.6)
+        proj_iters = total_iters - int(total_iters * 0.15)
     
     # 6. 同伦平滑迭代 (Homotopy + Winslow)
     for step in range(total_iters):
@@ -2567,7 +2573,7 @@ def on_grid_settings_update(self, context):
     finally:
         _in_grid_update = False
 
-def update_last_grid(context):
+def update_last_grid(context, IDs_to_adjust=None, is_interactive=False):
     import bmesh
     import bpy
     from mathutils import Vector
@@ -2575,6 +2581,11 @@ def update_last_grid(context):
     topo_obj = context.active_object
     if not topo_obj or topo_obj.type != 'MESH' or topo_obj.mode != 'EDIT':
         return
+        
+    ref_obj = None
+    ref_obj_name = context.window_manager.tp_ref_object_name
+    if ref_obj_name:
+        ref_obj = bpy.data.objects.get(ref_obj_name)
         
     bm = bmesh.from_edit_mesh(topo_obj.data)
     grid_layer = bm.faces.layers.int.get("tp_is_grid")
@@ -2594,23 +2605,26 @@ def update_last_grid(context):
     has_selection = bool(selected_verts or selected_edges or selected_faces)
     
     IDs_adjust = set()
-    if not has_selection:
-        # 如果未选择任何元素，仅微调最近一次生成的栅格（ID 最大的那个）
-        IDs_adjust.add(max(ids))
+    if IDs_to_adjust is not None:
+        IDs_adjust = set(IDs_to_adjust)
     else:
-        # 如果有选择，仅调整与选择元素相交的栅格区域
-        for f in selected_faces:
-            if f[grid_layer] > 0:
-                IDs_adjust.add(f[grid_layer])
-        for e in selected_edges:
-            for f in e.link_faces:
+        if not has_selection:
+            # 如果未选择任何元素，仅微调最近一次生成的栅格（ID 最大的那个）
+            IDs_adjust.add(max(ids))
+        else:
+            # 如果有选择，仅调整与选择元素相交的栅格区域
+            for f in selected_faces:
                 if f[grid_layer] > 0:
                     IDs_adjust.add(f[grid_layer])
-        for v in selected_verts:
-            for f in v.link_faces:
-                if f[grid_layer] > 0:
-                    IDs_adjust.add(f[grid_layer])
-                    
+            for e in selected_edges:
+                for f in e.link_faces:
+                    if f[grid_layer] > 0:
+                        IDs_adjust.add(f[grid_layer])
+            for v in selected_verts:
+                for f in v.link_faces:
+                    if f[grid_layer] > 0:
+                        IDs_adjust.add(f[grid_layer])
+                        
     if not IDs_adjust:
         return
         
@@ -2642,12 +2656,30 @@ def update_last_grid(context):
         if not loop_verts:
             continue
             
+        # Extract existing M, N, offset
+        ext_M, ext_N, ext_offset = None, None, None
+        corner_positions = []
+        for pos, v in enumerate(loop_verts):
+            internal_edge_count = sum(1 for e in v.link_edges if e in E_internal)
+            if internal_edge_count == 0:
+                corner_positions.append(pos)
+        if len(corner_positions) == 4:
+            c0, c1, c2, c3 = sorted(corner_positions)
+            ext_M = c1 - c0
+            ext_N = c2 - c1
+            ext_offset = c0
+            
+            # Keep boundary vertices in their original/tweaked positions when adjusting parameters
+
         grids_info[lid] = {
             'faces': F_loop,
             'E_internal': E_internal,
             'V_internal': V_internal,
             'E_boundary': E_boundary,
-            'loop_verts': loop_verts
+            'loop_verts': loop_verts,
+            'ext_M': ext_M,
+            'ext_N': ext_N,
+            'ext_offset': ext_offset
         }
         
     if not grids_info:
@@ -2698,15 +2730,25 @@ def update_last_grid(context):
     user_span = scene.tp_grid_span
     user_offset = scene.tp_grid_offset
     
-    # Find high-poly reference object
-    ref_obj = None
-    ref_obj_name = context.window_manager.tp_ref_object_name
-    if ref_obj_name:
-        ref_obj = bpy.data.objects.get(ref_obj_name)
+    # ref_obj already resolved at the top of the function
         
-    # 全局协调求解所有待调整圈的最佳参数
-    solved_params = solve_global_grid_parameters(active_loops, shared_boundaries, ref_obj, topo_obj, fixed_boundaries=fixed_boundaries)
-    params_map = {active_lids[k]: solved_params[k] for k in range(len(active_lids))}
+    # Check if we can skip solving global parameters
+    needs_solving = False
+    for lid in IDs_adjust:
+        info = grids_info.get(lid)
+        if info and (info.get('ext_M') is None or info.get('ext_N') is None or info.get('ext_offset') is None):
+            needs_solving = True
+            break
+            
+    if needs_solving:
+        # 全局协调求解所有待调整圈的最佳参数
+        solved_params = solve_global_grid_parameters(active_loops, shared_boundaries, ref_obj, topo_obj, fixed_boundaries=fixed_boundaries)
+        params_map = {active_lids[k]: solved_params[k] for k in range(len(active_lids))}
+    else:
+        params_map = {
+            lid: (grids_info[lid]['ext_M'], grids_info[lid]['ext_N'], grids_info[lid]['ext_offset'])
+            for lid in active_lids
+        }
     
     # 2. 此时才安全批量物理删除所有待调整 grid 的内部面、内部边 and 内部点 (之前为了拓扑分析不被破坏而予以保留)
     for lid, info in grids_info.items():
@@ -2726,24 +2768,22 @@ def update_last_grid(context):
         loop_verts = info['loop_verts']
         L = len(loop_verts)
         
-        params = params_map[lid]
-        if params is None:
-            # 兜底保障
-            half_L = L // 2
-            N = half_L // 2
-            M = half_L - N
-            offset = 0
+        if IDs_to_adjust is not None and info.get('ext_M') is not None:
+            M = info['ext_M']
+            N = info['ext_N']
+            offset = info['ext_offset']
         else:
-            M, N, offset = params
-            
-        # 检查该子圈是否涉及任何固定或共享边界约束。如果有，则不允许用户通过 slider 强行覆盖参数，以保全缝合拓扑。
-        has_constraints = False
-        if any(fb['cycle_active'] == k for fb in fixed_boundaries):
-            has_constraints = True
-        if any(sb['cycle_a'] == k or sb['cycle_b'] == k for sb in shared_boundaries):
-            has_constraints = True
-            
-        if not has_constraints:
+            params = params_map[lid]
+            if params is None:
+                # 兜底保障
+                half_L = L // 2
+                N = half_L // 2
+                M = half_L - N
+                offset = 0
+            else:
+                M, N, offset = params
+                
+            # 允许用户通过 slider 强行覆盖参数以进行微调和调整
             if user_span >= 2:
                 half_L = L // 2
                 N = max(1, min(half_L - 1, user_span))
@@ -2752,13 +2792,24 @@ def update_last_grid(context):
             
         # Initialize and optimize grid
         grid_coords = init_coons_grid(loop_verts, M, N, offset)
-        optimize_grid(
-            grid_coords, M, N,
-            ref_obj=ref_obj,
-            topo_obj=topo_obj,
-            iterations=40,
-            spring_factor=0.3
-        )
+        if is_interactive:
+            optimize_grid(
+                grid_coords, M, N,
+                ref_obj=None,
+                topo_obj=topo_obj,
+                iterations=5,
+                spring_factor=0.3,
+                is_interactive=True
+            )
+        else:
+            optimize_grid(
+                grid_coords, M, N,
+                ref_obj=ref_obj,
+                topo_obj=topo_obj,
+                iterations=40,
+                spring_factor=0.3,
+                is_interactive=False
+            )
         
         # Create new vertices and faces
         def get_loop_vert(index):
@@ -2835,6 +2886,31 @@ def update_last_grid(context):
     # Update edit mesh and viewport
     bmesh.update_edit_mesh(topo_obj.data)
     context.area.tag_redraw()
+
+def update_grids_for_vertices(context, moved_vert_indices, is_interactive=False):
+    import bmesh
+    topo_obj = context.active_object
+    if not topo_obj or topo_obj.type != 'MESH' or topo_obj.mode != 'EDIT':
+        return
+        
+    bm = bmesh.from_edit_mesh(topo_obj.data)
+    grid_layer = bm.faces.layers.int.get("tp_is_grid")
+    if not grid_layer:
+        return
+        
+    IDs_adjust = set()
+    moved_indices_set = set(moved_vert_indices)
+    
+    for f in bm.faces:
+        lid = f[grid_layer]
+        if lid > 0:
+            for v in f.verts:
+                if v.index in moved_indices_set:
+                    IDs_adjust.add(lid)
+                    break
+                    
+    if IDs_adjust:
+        update_last_grid(context, IDs_to_adjust=IDs_adjust, is_interactive=is_interactive)
 
 
 
