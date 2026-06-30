@@ -1,6 +1,7 @@
 import bpy
 import bmesh
 import mathutils
+import time
 from mathutils import kdtree
 from bpy_extras.view3d_utils import (
     region_2d_to_origin_3d,
@@ -166,6 +167,15 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             self.last_boundary_mode = boundary_mode
             if boundary_mode:
                 self.clear_internal_selections(context)
+                try:
+                    context.scene.tool_settings.mesh_select_mode = (False, True, False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    context.scene.tool_settings.mesh_select_mode = (True, False, False)
+                except Exception:
+                    pass
 
         ref_obj = bpy.data.objects.get(self.ref_object_name)
         topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
@@ -295,11 +305,16 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         self.ui_click_start_pos = None
         self.ui_click_edge_length = 0.1
         self.ui_is_dragging = False
+        # Double-click detection tracking (time-based, since DOUBLE_CLICK value not fired in modal)
+        self._boundary_last_click_time = 0.0
+        self._boundary_last_click_idx = None
         self.is_smoothing = False
         self.smooth_mouse_start = (event.mouse_region_x, event.mouse_region_y)
         self.smooth_dragged = False
         self.smooth_brush_radius = 50.0
         self.alt_pressed = event.alt
+        self.shift_pressed = event.shift
+        self.was_loopcut_active = False
         
         ref_obj.hide_select = True
         ref_obj.select_set(False)
@@ -319,7 +334,10 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         
         try:
             bpy.ops.object.mode_set(mode='EDIT')
-            context.scene.tool_settings.mesh_select_mode = (True, False, False)
+            if context.scene.tp_boundary_mode:
+                context.scene.tool_settings.mesh_select_mode = (False, True, False)
+            else:
+                context.scene.tool_settings.mesh_select_mode = (True, False, False)
         except Exception as e:
             print("Failed to enter Edit Mode:", e)
             
@@ -387,16 +405,59 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         context.area.tag_redraw()
         return {'RUNNING_MODAL'}
 
+    def is_loopcut_active(self, context):
+        # Check modal operators (Blender 4.2+)
+        window = getattr(context, "window", None)
+        if window and hasattr(window, "modal_operators"):
+            for op in window.modal_operators:
+                if "loopcut" in op.bl_idname.lower() or "loop_cut" in op.bl_idname.lower():
+                    return True
+
+        # Check active tool (if activated via toolbar)
+        try:
+            workspace = context.workspace
+            if workspace and hasattr(workspace, "tools"):
+                mode = getattr(context, "mode", 'EDIT_MESH')
+                active_tool = workspace.tools.from_space_view3d_mode(mode)
+                if active_tool and ("loopcut" in active_tool.idname.lower() or "loop_cut" in active_tool.idname.lower()):
+                    return True
+        except Exception as e:
+            print("Error checking active tool:", e)
+
+        return False
+
     def modal(self, context, event):
         if not context.window_manager.tp_topology_running:
             self.cleanup(context)
             self.report({'INFO'}, "已退出TP拓扑模式")
             return {'FINISHED'}
 
-        # Update alt_pressed state and trigger redraw on change
+        # Check if loop cut is active
+        loopcut_active = self.is_loopcut_active(context)
+        if loopcut_active:
+            self.was_loopcut_active = True
+            return {'PASS_THROUGH'}
+        else:
+            if getattr(self, 'was_loopcut_active', False):
+                self.was_loopcut_active = False
+                self.rebuild_kd_tree()
+                self.subdiv_original_loops = None
+                self.subdiv_multiplier = 1.0
+                if context.scene.tp_boundary_mode:
+                    self.clear_internal_selections(context)
+
+
+
+        # Update alt_pressed and shift_pressed state and trigger redraw on change
         alt_state = event.alt
         if getattr(self, 'alt_pressed', False) != alt_state:
             self.alt_pressed = alt_state
+            if context.area:
+                context.area.tag_redraw()
+
+        shift_state = event.shift
+        if getattr(self, 'shift_pressed', False) != shift_state:
+            self.shift_pressed = shift_state
             if context.area:
                 context.area.tag_redraw()
 
@@ -481,8 +542,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 return {'RUNNING_MODAL'}
 
         if event.value == 'PRESS':
-            if event.type == 'LEFTMOUSE' and event.alt:
-                if context.scene.tp_boundary_mode:
+            if event.type == 'LEFTMOUSE':
+                if event.shift and not event.alt and context.scene.tp_boundary_mode:
                     self.is_smoothing = True
                     self.smooth_mouse_start = (event.mouse_region_x, event.mouse_region_y)
                     self.last_mouse_coord = (event.mouse_region_x, event.mouse_region_y)
@@ -511,8 +572,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     context.workspace.status_text_set("TP拓扑平滑边界 | 拖动鼠标: 平滑白线边界 | 释放左键: 确定 | ESC/右键: 取消")
                     context.area.tag_redraw()
                     return {'RUNNING_MODAL'}
-                else:
-                    return self.perform_loop_selection(context, (event.mouse_region_x, event.mouse_region_y), event.shift)
+                elif event.alt:
+                    return self.perform_loop_selection(context, (event.mouse_region_x, event.mouse_region_y), event.shift, alt_pressed=True)
 
             if event.type == 'Z' and event.ctrl:
                 if event.shift:
@@ -692,6 +753,58 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     self.rebuild_kd_tree()
                     element_type, target_indices, active_idx = self.find_nearest_boundary_element(context, coord, threshold_pixels=20)
                     
+                    if element_type is not None and active_idx is not None:
+                        # --- Double-click detection: two PRESS events within 0.35s on same vertex ---
+                        now = time.time()
+                        last_t = getattr(self, '_boundary_last_click_time', 0.0)
+                        last_idx = getattr(self, '_boundary_last_click_idx', None)
+                        if (now - last_t) < 0.35 and last_idx == active_idx:
+                            # This is a double-click: toggle pin, skip grab
+                            self._boundary_last_click_time = 0.0
+                            self._boundary_last_click_idx = None
+                            topo_obj = self.ensure_topo_obj_exists(context)
+                            if topo_obj.mode != 'EDIT':
+                                try:
+                                    bpy.ops.object.mode_set(mode='EDIT')
+                                except Exception as e:
+                                    print("Failed to enter Edit Mode on double click:", e)
+                            
+                            # Cancel any pending grab
+                            self.is_grabbing = False
+                            self.is_dragging_grab = False
+                            if getattr(self, 'grab_backup_bm', None):
+                                self.grab_backup_bm.free()
+                                self.grab_backup_bm = None
+                            
+                            bm = bmesh.from_edit_mesh(topo_obj.data)
+                            bm.verts.ensure_lookup_table()
+                            bm.verts.index_update()
+                            # Get/create layers BEFORE fetching vertex reference:
+                            # adding a new layer can rebuild BMesh internals and
+                            # invalidate any pre-existing BMVert references.
+                            pin_layer = bm.verts.layers.int.get("tp_is_pinned") or bm.verts.layers.int.new("tp_is_pinned")
+                            co_layer = bm.verts.layers.float_vector.get("tp_pinned_co") or bm.verts.layers.float_vector.new("tp_pinned_co")
+                            bm.verts.ensure_lookup_table()
+                            if active_idx < len(bm.verts):
+                                v = bm.verts[active_idx]
+                                new_pin_val = 0 if v[pin_layer] == 1 else 1
+                                v[pin_layer] = new_pin_val
+                                v[co_layer] = v.co.copy()
+                                bmesh.update_edit_mesh(topo_obj.data)
+                                update_pinned_coordinates(context)
+                                self.report({'INFO'}, "已固定点" if new_pin_val == 1 else "已取消固定点")
+                                try:
+                                    bpy.ops.ed.undo_push(message="TP 双击固定/取消固定")
+                                except Exception:
+                                    pass
+                            context.area.tag_redraw()
+                            return {'RUNNING_MODAL'}
+                        else:
+                            # Record this click for potential double-click on next press
+                            self._boundary_last_click_time = now
+                            self._boundary_last_click_idx = active_idx
+                        # --------------------------------------------------------------------------
+
                     if element_type is not None:
                         topo_obj = self.ensure_topo_obj_exists(context)
                         if topo_obj.mode != 'EDIT':
@@ -702,6 +815,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                 
                         bm = bmesh.from_edit_mesh(topo_obj.data)
                         bm.verts.ensure_lookup_table()
+                        bm.verts.index_update()
                         
                         selected_verts = [bm.verts[idx] for idx in target_indices if idx < len(bm.verts)]
                         
@@ -711,16 +825,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                 self.grab_backup_bm.free()
                             self.grab_backup_bm = bm.copy()
                             
-                            # 2. Deselect everything in the BMesh so that no object is selected during the drag
-                            for v in bm.verts:
-                                v.select = False
-                            for e in bm.edges:
-                                e.select = False
-                            for f in bm.faces:
-                                f.select = False
-                            bmesh.update_edit_mesh(topo_obj.data)
-                            
-                            # 3. Initialize grab state
+                            # 2. Initialize grab state
                             self.rebuild_kd_tree()
                             self.is_grabbing = True
                             self.is_dragging_grab = True
@@ -731,8 +836,17 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             
                             region = context.region
                             rv3d = context.space_data.region_3d
-                            active_v = bm.verts[active_idx]
-                            active_start_world = topo_obj.matrix_world @ active_v.co
+                            if active_idx < len(bm.verts):
+                                active_v = bm.verts[active_idx]
+                            else:
+                                active_v = selected_verts[0] if selected_verts else None
+                                if active_v:
+                                    active_idx = active_v.index
+                            
+                            if active_v:
+                                active_start_world = topo_obj.matrix_world @ active_v.co
+                            else:
+                                active_start_world = topo_obj.matrix_world @ mathutils.Vector((0, 0, 0))
                             self.last_valid_active_world = active_start_world.copy()
                             ray_origin_start = region_2d_to_origin_3d(region, rv3d, self.grab_mouse_start)
                             ray_vector_start = region_2d_to_vector_3d(region, rv3d, self.grab_mouse_start)
@@ -1276,6 +1390,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if topo_obj.mode == 'EDIT':
             try:
                 bm = bmesh.from_edit_mesh(topo_obj.data)
+                bm.verts.index_update()
                 if not bm.verts:
                     self.kd_tree = None
                     return
@@ -1405,6 +1520,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
         bm.verts.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
+        bm.verts.index_update()
         
         from .draw_utils import get_seam_target_edges_local
         try:
@@ -1516,7 +1632,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             return True
             
         # 4. Check if click is close to ANY edge (which must be internal)
-        nearest_edge = self.find_nearest_edge(context, mouse_coord, threshold_pixels=threshold_pixels)
+        nearest_edge = self.find_nearest_edge(context, mouse_coord, threshold_pixels=threshold_pixels, exclude_internal=False)
         if nearest_edge is not None:
             if not is_edit:
                 bm.free()
@@ -1640,6 +1756,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         import bmesh
         bm = bmesh.from_edit_mesh(topo_obj.data)
         bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
         
         # Default behavior: only move selected verts with weight 1.0
         for v in selected_verts:
@@ -1664,109 +1781,57 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             selected_boundary_indices = [v.index for v in selected_verts if v.index in boundary_vert_indices]
             
             if selected_boundary_indices:
-                # Find all paths and loops
-                paths_and_loops = self.get_boundary_paths_and_loops(bm, boundary_edges)
                 pin_layer = bm.verts.layers.int.get("tp_is_pinned")
                 
                 # Influence radius in steps for boundary dragging
                 max_r = 5
                 
-                for item in paths_and_loops:
-                    path_verts = item['verts']
-                    is_closed = item['closed']
-                    L = len(path_verts)
+                # Build adjacency list for boundary graph
+                boundary_adj = {}
+                for e in boundary_edges:
+                    v1_idx = e.verts[0].index
+                    v2_idx = e.verts[1].index
+                    boundary_adj.setdefault(v1_idx, []).append(v2_idx)
+                    boundary_adj.setdefault(v2_idx, []).append(v1_idx)
+                
+                # BFS queue and distances dict
+                import collections
+                queue = collections.deque()
+                distances = {}
+                
+                # Initialize BFS with selected boundary vertices
+                for idx in selected_boundary_indices:
+                    distances[idx] = 0
+                    queue.append(idx)
                     
-                    # Find which selected boundary verts are in this path/loop
-                    selected_in_path = [idx for idx in selected_boundary_indices if idx in path_verts]
-                    if not selected_in_path:
+                while queue:
+                    curr_idx = queue.popleft()
+                    curr_dist = distances[curr_idx]
+                    
+                    if curr_dist >= max_r:
                         continue
                         
-                    # Map vertex index to its position in the path list
-                    idx_to_pos = {idx: pos for pos, idx in enumerate(path_verts)}
-                    sel_positions = sorted([idx_to_pos[idx] for idx in selected_in_path])
-                    
-                    # Identify the boundaries of the selected segment
-                    if len(sel_positions) == 1:
-                        left_start_pos = sel_positions[0]
-                        right_start_pos = sel_positions[0]
-                    else:
-                        if not is_closed:
-                            left_start_pos = sel_positions[0]
-                            right_start_pos = sel_positions[-1]
-                        else:
-                            # For closed loops, find the largest gap between consecutive selected vertices
-                            max_gap = 0
-                            gap_pair = (sel_positions[-1], sel_positions[0])
+                    # Traverse neighbors in the boundary graph
+                    for nbr_idx in boundary_adj.get(curr_idx, []):
+                        if nbr_idx not in distances:
+                            distances[nbr_idx] = curr_dist + 1
                             
-                            # Wrap around gap
-                            wrap_gap = (sel_positions[0] - sel_positions[-1]) % L
-                            if wrap_gap > max_gap:
-                                max_gap = wrap_gap
-                                gap_pair = (sel_positions[-1], sel_positions[0])
+                            # If the neighbor is pinned, do not propagate past it
+                            nbr_v = bm.verts[nbr_idx]
+                            is_pinned = pin_layer and (nbr_v[pin_layer] == 1)
+                            if not is_pinned:
+                                queue.append(nbr_idx)
                                 
-                            for i in range(len(sel_positions) - 1):
-                                gap = sel_positions[i+1] - sel_positions[i]
-                                if gap > max_gap:
-                                    max_gap = gap
-                                    gap_pair = (sel_positions[i], sel_positions[i+1])
-                                    
-                            # We trace left from gap_pair[1], and right from gap_pair[0]
-                            left_start_pos = gap_pair[1]
-                            right_start_pos = gap_pair[0]
-                            
-                    # Trace left subpath
-                    left_subpath = []
-                    for i in range(1, L):
-                        if i > max_r:
-                            break
-                        curr_pos = (left_start_pos - i) % L if is_closed else left_start_pos - i
-                        if not is_closed and curr_pos < 0:
-                            break
-                        if curr_pos in sel_positions:
-                            break
-                        v_idx = path_verts[curr_pos]
-                        left_subpath.append(v_idx)
-                        v_bm = bm.verts[v_idx]
-                        if pin_layer and v_bm[pin_layer] == 1:
-                            break
-                            
-                    # Trace right subpath
-                    right_subpath = []
-                    for i in range(1, L):
-                        if i > max_r:
-                            break
-                        curr_pos = (right_start_pos + i) % L if is_closed else right_start_pos + i
-                        if not is_closed and curr_pos >= L:
-                            break
-                        if curr_pos in sel_positions:
-                            break
-                        v_idx = path_verts[curr_pos]
-                        right_subpath.append(v_idx)
-                        v_bm = bm.verts[v_idx]
-                        if pin_layer and v_bm[pin_layer] == 1:
-                            break
-                            
-                    # Calculate weights for left subpath using C2 smootherstep
-                    # Custom step weights requested by the user
-                    weight_lut = {1: 0.70, 2: 0.40, 3: 0.20, 4: 0.10}
-                    
-                    # Calculate weights for left subpath
-                    for d_idx, v_idx in enumerate(left_subpath):
-                        d = d_idx + 1
-                        weight = weight_lut.get(d, 0.0)
-                        if weight > 0.0:
-                            if v_idx not in self.grab_weights or weight > self.grab_weights[v_idx]:
-                                self.grab_weights[v_idx] = weight
-                                self.grab_initial_cos[v_idx] = bm.verts[v_idx].co.copy()
-                                
-                    # Calculate weights for right subpath
-                    for d_idx, v_idx in enumerate(right_subpath):
-                        d = d_idx + 1
-                        weight = weight_lut.get(d, 0.0)
-                        if weight > 0.0:
-                            if v_idx not in self.grab_weights or weight > self.grab_weights[v_idx]:
-                                self.grab_weights[v_idx] = weight
-                                self.grab_initial_cos[v_idx] = bm.verts[v_idx].co.copy()
+                # Calculate weights for all reached vertices using custom step weights
+                weight_lut = {1: 0.70, 2: 0.40, 3: 0.20, 4: 0.10}
+                for v_idx, dist in distances.items():
+                    if dist == 0:
+                        continue  # Selected vertices already have weight 1.0 set
+                    weight = weight_lut.get(dist, 0.0)
+                    if weight > 0.0:
+                        if v_idx not in self.grab_weights or weight > self.grab_weights[v_idx]:
+                            self.grab_weights[v_idx] = weight
+                            self.grab_initial_cos[v_idx] = bm.verts[v_idx].co.copy()
 
 
 
@@ -1826,7 +1891,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         cycles.sort(key=lambda c: len(c))
         return cycles
 
-    def find_nearest_edge(self, context, mouse_coord, threshold_pixels=20):
+    def find_nearest_edge(self, context, mouse_coord, threshold_pixels=20, exclude_internal=True):
         topo_obj_name = "TP_Topology_Mesh"
         topo_obj = bpy.data.objects.get(topo_obj_name)
         if not topo_obj or topo_obj.mode != 'EDIT':
@@ -1838,10 +1903,20 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         rv3d = context.space_data.region_3d
         p_mouse = mathutils.Vector(mouse_coord)
         
+        boundary_edges = None
+        if exclude_internal and getattr(context.scene, "tp_boundary_mode", False):
+            from .draw_utils import get_seam_target_edges_local
+            try:
+                boundary_edges = get_seam_target_edges_local(bm)
+            except Exception as e:
+                print("Error getting boundary edges in find_nearest_edge:", e)
+                
         nearest_edge = None
         min_dist = threshold_pixels
         
         for e in bm.edges:
+            if boundary_edges is not None and e not in boundary_edges:
+                continue
             p1 = location_3d_to_region_2d(region, rv3d, matrix_world @ e.verts[0].co)
             p2 = location_3d_to_region_2d(region, rv3d, matrix_world @ e.verts[1].co)
             if p1 and p2:
@@ -1896,7 +1971,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
         return chain_edges
 
-    def perform_loop_selection(self, context, mouse_coord, shift_pressed):
+    def perform_loop_selection(self, context, mouse_coord, shift_pressed, alt_pressed=False):
         topo_obj_name = "TP_Topology_Mesh"
         topo_obj = bpy.data.objects.get(topo_obj_name)
         if topo_obj and topo_obj.mode == 'EDIT':
@@ -1933,7 +2008,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     except Exception as e:
                         print("Error checking boundary vert in loop selection:", e)
 
-                if is_boundary_vert:
+                if is_boundary_vert and not alt_pressed:
                     if shift_pressed:
                         v_target.select = not v_target.select
                         if v_target.select:
@@ -2027,7 +2102,6 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                 nearest_edge.select = True
                                 bm.select_history.clear()
                                 bm.select_history.add(nearest_edge)
-                                bm.select_history.active = nearest_edge
                                 bmesh.update_edit_mesh(topo_obj.data)
                                 
                                 selected_count_pre_op = sum(1 for e in bm.edges if e.select)
@@ -2073,63 +2147,91 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             else:
                 nearest_edge = self.find_nearest_edge(context, mouse_coord, threshold_pixels=20)
                 if nearest_edge:
-                    success_native = False
-                    if len(nearest_edge.link_faces) >= 1:
-                        try:
+                    if context.scene.tp_boundary_mode and not alt_pressed:
+                        # In boundary mode, without Alt, clicking an edge selects just that edge
+                        if shift_pressed:
+                            # Toggle selection of this edge
+                            nearest_edge.select = not nearest_edge.select
+                            if nearest_edge.select:
+                                nearest_edge.verts[0].select = True
+                                nearest_edge.verts[1].select = True
+                            else:
+                                # Deselect vertices if they are not connected to any other selected edge
+                                for v in nearest_edge.verts:
+                                    if not any(e.select for e in v.link_edges if e != nearest_edge):
+                                        v.select = False
+                        else:
+                            for v in bm.verts:
+                                v.select = False
+                            for e in bm.edges:
+                                e.select = False
+                            nearest_edge.select = True
+                            nearest_edge.verts[0].select = True
+                            nearest_edge.verts[1].select = True
+                            bm.select_history.clear()
+                            bm.select_history.add(nearest_edge)
+                        
+                        bmesh.update_edit_mesh(topo_obj.data)
+                        self.report({'INFO'}, "已加选边界边" if shift_pressed else "已选中边界边")
+                    else:
+                        success_native = False
+                        if len(nearest_edge.link_faces) >= 1:
+                            try:
+                                if not shift_pressed:
+                                    for v in bm.verts:
+                                        v.select = False
+                                    for e in bm.edges:
+                                        e.select = False
+                                
+                                # 确保边被选中，并被设置为选择历史中的活动项
+                                nearest_edge.select = True
+                                bm.select_history.clear()
+                                bm.select_history.add(nearest_edge)
+                                bmesh.update_edit_mesh(topo_obj.data)
+                                
+                                selected_count_pre_op = sum(1 for e in bm.edges if e.select)
+                                
+                                # 确保拓扑对象为当前视图层的活动对象以调用此编辑模式操作符
+                                context.view_layer.objects.active = topo_obj
+                                bpy.ops.mesh.loop_select(extend=shift_pressed)
+                                
+                                # 重新加载网格数据并检查选择数量是否发生改变
+                                bm = bmesh.from_edit_mesh(topo_obj.data)
+                                bm.verts.ensure_lookup_table()
+                                bm.edges.ensure_lookup_table()
+                                
+                                selected_count_post_op = sum(1 for e in bm.edges if e.select)
+                                if selected_count_post_op > selected_count_pre_op:
+                                    success_native = True
+                                else:
+                                    success_native = False
+                            except Exception as e:
+                                print("Native loop select failed, falling back:", e)
+                                success_native = False
+                                
+                        if not success_native:
+                            grid_layer = bm.faces.layers.int.get("tp_is_grid")
+                            chain_edges = self.find_edge_chain(nearest_edge, grid_layer=grid_layer)
+                            
                             if not shift_pressed:
                                 for v in bm.verts:
                                     v.select = False
                                 for e in bm.edges:
                                     e.select = False
-                            
-                            # 确保边被选中，并被设置为选择历史中的活动项
-                            nearest_edge.select = True
-                            bm.select_history.clear()
-                            bm.select_history.add(nearest_edge)
-                            bm.select_history.active = nearest_edge
+                                    
+                            for e in chain_edges:
+                                e.select = True
+                                e.verts[0].select = True
+                                e.verts[1].select = True
+                                
                             bmesh.update_edit_mesh(topo_obj.data)
                             
-                            selected_count_pre_op = sum(1 for e in bm.edges if e.select)
-                            
-                            # 确保拓扑对象为当前视图层的活动对象以调用此编辑模式操作符
-                            context.view_layer.objects.active = topo_obj
-                            bpy.ops.mesh.loop_select(extend=shift_pressed)
-                            
-                            # 重新加载网格数据并检查选择数量是否发生改变
-                            bm = bmesh.from_edit_mesh(topo_obj.data)
-                            bm.verts.ensure_lookup_table()
-                            bm.edges.ensure_lookup_table()
-                            
-                            selected_count_post_op = sum(1 for e in bm.edges if e.select)
-                            if selected_count_post_op > selected_count_pre_op:
-                                success_native = True
-                            else:
-                                success_native = False
-                        except Exception as e:
-                            print("Native loop select failed, falling back:", e)
-                            success_native = False
-                            
-                    if not success_native:
-                        grid_layer = bm.faces.layers.int.get("tp_is_grid")
-                        chain_edges = self.find_edge_chain(nearest_edge, grid_layer=grid_layer)
-                        
-                        if not shift_pressed:
-                            for v in bm.verts:
-                                v.select = False
-                            for e in bm.edges:
-                                e.select = False
-                                
-                        for e in chain_edges:
-                            e.select = True
-                            e.verts[0].select = True
-                            e.verts[1].select = True
-                            
-                        bmesh.update_edit_mesh(topo_obj.data)
-                        
-                    self.report({'INFO'}, "已选中循环边")
+                        self.report({'INFO'}, "已选中循环边")
                 else:
                     self.report({'INFO'}, "未检测到附近的点或边")
                     
+            if context.scene.tp_boundary_mode:
+                self.clear_internal_selections(context)
             context.area.tag_redraw()
         return {'RUNNING_MODAL'}
 
@@ -3534,7 +3636,18 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     
                 E_boundary = {e for e in E_loop_all if len([f for f in e.link_faces if f[grid_layer] == lid]) == 1}
                 ordered_verts = self.trace_boundary_loop_from_edges(bm, E_boundary)
-                if ordered_verts:
+                V_boundary = {v for e in E_boundary for v in e.verts}
+                
+                # Check boundary vertex degrees in boundary graph to detect pinch points (degree != 2)
+                bnd_adj = {v: [] for v in V_boundary}
+                for e in E_boundary:
+                    v1, v2 = e.verts
+                    bnd_adj[v1].append(v2)
+                    bnd_adj[v2].append(v1)
+                    
+                is_pinched = any(len(neighbors) != 2 for neighbors in bnd_adj.values())
+                
+                if ordered_verts and len(ordered_verts) >= len(V_boundary) and not is_pinched:
                     loops.append({
                         'type': 'rasterized',
                         'loop_id': lid,
@@ -3927,7 +4040,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     
             if predicted_loop_edge_lens:
                 predicted_avg_edge_len = sum(predicted_loop_edge_lens) / len(predicted_loop_edge_lens)
-                if predicted_avg_edge_len < 0.05:
+                if predicted_avg_edge_len < 0.05 and self.subdiv_multiplier > prev_multiplier:
                     # Revert the multiplier
                     self.subdiv_multiplier = prev_multiplier
                     
@@ -4003,11 +4116,6 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         for loop_info in created_loops:
             loop_info['vert_indices'] = [v.index for v in loop_info['new_verts'] if v.is_valid and v.index >= 0]
         self.rebuild_kd_tree()
-        
-        try:
-            bpy.ops.ed.undo_push(message="TP 全局循环圈细分")
-        except Exception as e:
-            print("Error pushing undo step during global subdivision:", e)
             
         # 7. Grid-fill all rasterized loops in a SINGLE call so that spliced rings
         #    (which share boundary vertices) are filled together as a coordinated group.
@@ -4106,6 +4214,13 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
         bmesh.update_edit_mesh(topo_obj.data)
         self.rebuild_kd_tree()
+        
+        # Push undo AFTER grid fill and remove_doubles so that Ctrl+Z restores
+        # the fully-filled state (not the intermediate wire-loop state).
+        try:
+            bpy.ops.ed.undo_push(message="TP 全局循环圈细分")
+        except Exception as e:
+            print("Error pushing undo step during global subdivision:", e)
         
         # 9. Update the edge length parameter in the scene / N-panel
         total_loop_edge_lens = []
@@ -4230,7 +4345,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             self.is_grabbing = False
             self.hover_snap_pt = None
             return {'PASS_THROUGH'}
-            
+
         region = context.region
         rv3d = context.space_data.region_3d
         
@@ -4308,20 +4423,23 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if is_confirm:
             bm = bmesh.from_edit_mesh(topo_obj.data)
             bm.verts.ensure_lookup_table()
+            bm.verts.index_update()
             
             if self.grab_snap_target_idx is not None:
-                active_v = bm.verts[self.grab_active_vert_idx]
-                target_v = bm.verts[self.grab_snap_target_idx]
-                
-                if active_v.is_valid and target_v.is_valid and active_v != target_v:
-                    pin_layer = bm.verts.layers.int.get("tp_is_pinned")
-                    is_active_pinned = pin_layer and (active_v[pin_layer] == 1)
-                    if not is_active_pinned:
-                        active_v.co = target_v.co.copy()
-                        try:
-                            bmesh.ops.weld_verts(bm, targetmap={active_v: target_v})
-                        except Exception as e:
-                            print("Weld verts error:", e)
+                if (self.grab_active_vert_idx is not None and self.grab_active_vert_idx < len(bm.verts) and
+                    self.grab_snap_target_idx < len(bm.verts)):
+                    active_v = bm.verts[self.grab_active_vert_idx]
+                    target_v = bm.verts[self.grab_snap_target_idx]
+                    
+                    if active_v.is_valid and target_v.is_valid and active_v != target_v:
+                        pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+                        is_active_pinned = pin_layer and (active_v[pin_layer] == 1)
+                        if not is_active_pinned:
+                            active_v.co = target_v.co.copy()
+                            try:
+                                bmesh.ops.weld_verts(bm, targetmap={active_v: target_v})
+                            except Exception as e:
+                                print("Weld verts error:", e)
                         
             try:
                 if context.scene.tp_boundary_mode:
@@ -4375,6 +4493,23 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 dy = event.mouse_region_y - self.grab_mouse_start[1]
                 if (dx * dx + dy * dy) > 25:  # 5 pixels threshold
                     self.grab_dragged = True
+                    if context.scene.tp_boundary_mode:
+                        bm_select = bmesh.from_edit_mesh(topo_obj.data)
+                        bm_select.verts.ensure_lookup_table()
+                        bm_select.edges.ensure_lookup_table()
+                        bm_select.faces.ensure_lookup_table()
+                        for v in bm_select.verts:
+                            v.select = False
+                        for e in bm_select.edges:
+                            e.select = False
+                        for f in bm_select.faces:
+                            f.select = False
+                        if self.grab_active_vert_idx is not None and 0 <= self.grab_active_vert_idx < len(bm_select.verts):
+                            dragged_v = bm_select.verts[self.grab_active_vert_idx]
+                            dragged_v.select = True
+                            bm_select.select_history.clear()
+                            bm_select.select_history.add(dragged_v)
+                        bmesh.update_edit_mesh(topo_obj.data)
                 else:
                     return {'RUNNING_MODAL'}
             
@@ -4391,8 +4526,21 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
             bm = bmesh.from_edit_mesh(topo_obj.data)
             bm.verts.ensure_lookup_table()
+            bm.verts.index_update()
+            
+            if self.grab_active_vert_idx is None or self.grab_active_vert_idx >= len(bm.verts) or self.grab_active_vert_idx < 0:
+                print(f"TP Grab Warning: self.grab_active_vert_idx ({self.grab_active_vert_idx}) is out of range. Cancelling grab.")
+                self.is_grabbing = False
+                self.is_dragging_grab = False
+                self.hover_snap_pt = None
+                self.grab_snap_target_idx = None
+                context.workspace.status_text_set("TP拓扑模式 | Ctrl+left-click drag: continuous draw | Ctrl+left-click single: draw segment | Alt+left-click: select loop | right-click/Enter: submit | ESC to exit")
+                context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
             
             active_v = bm.verts[self.grab_active_vert_idx]
+            if self.grab_active_vert_idx not in self.grab_initial_cos:
+                self.grab_initial_cos[self.grab_active_vert_idx] = active_v.co.copy()
             active_start_local = self.grab_initial_cos[self.grab_active_vert_idx]
             
             delta_local = active_new_local - active_start_local
@@ -4478,7 +4626,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     snap_candidate_co = None
                     
                     for co, idx, dist in nearest:
-                        if idx in self.grab_initial_cos:
+                        if idx == active_v.index:
                             continue
                             
                         # In boundary mode, do not snap to internal grid vertices, only to other white edge vertices
@@ -4486,16 +4634,22 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             if active_v.index in self.internal_grid_verts or idx in self.internal_grid_verts:
                                 continue
                                 
-                        screen_coord = location_3d_to_region_2d(region, rv3d, co)
+                        # Use target vertex's real-time coordinate from BMesh
+                        if idx < len(bm.verts):
+                            target_co_world = topo_world @ bm.verts[idx].co
+                        else:
+                            target_co_world = co
+                            
+                        screen_coord = location_3d_to_region_2d(region, rv3d, target_co_world)
                         if screen_coord:
                             dist_px = (screen_coord - mouse_vec).length
                             if dist_px < min_dist_px:
                                 # Prevent snapping to vertices on the opposite side of the reference mesh
-                                if context.scene.tp_boundary_mode and self.is_point_occluded(context, ref_obj, co, region, rv3d):
+                                if context.scene.tp_boundary_mode and self.is_point_occluded(context, ref_obj, target_co_world, region, rv3d):
                                     continue
                                 min_dist_px = dist_px
                                 snap_candidate_idx = idx
-                                snap_candidate_co = co
+                                snap_candidate_co = target_co_world
                                 
                     if snap_candidate_idx is not None:
                         crosses = self.check_line_crosses_ref_mesh(ref_obj, snap_candidate_co, active_projected_world)
@@ -4791,6 +4945,110 @@ def tp_pin_depsgraph_handler(scene, depsgraph=None):
     import bmesh
     is_edit = (topo_obj.mode == 'EDIT')
     
+    # 0. New face loop ID tracking for boundary extrusion
+    global _active_draw_operator
+    active_op = _active_draw_operator
+    if is_edit and active_op is not None:
+        _in_pin_handler = True
+        try:
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            # Ensure all vertices have valid indices (assign positive indices to new vertices with index -1)
+            # without shifting the indices of existing vertices
+            max_idx = -1
+            for v in bm.verts:
+                if v.index > max_idx:
+                    max_idx = v.index
+            next_idx = max_idx + 1
+            for v in bm.verts:
+                if v.index < 0:
+                    v.index = next_idx
+                    next_idx += 1
+            grid_layer = bm.faces.layers.int.get("tp_is_grid")
+            if not grid_layer:
+                grid_layer = bm.faces.layers.int.new("tp_is_grid")
+                
+            # Use coordinate-based signatures to make them completely stable across
+            # Blender's Edit Mode vertex re-indexing/shifting operations.
+            def get_face_sig(f):
+                return frozenset(tuple(round(c, 4) for c in v.co) for v in f.verts)
+                
+            current_keys = set()
+            for f in bm.faces:
+                current_keys.add(get_face_sig(f))
+                
+            # If the active draw operator is currently in an interactive modal state (such as dragging,
+            # smoothing, or drawing), we are reconstructing or modifying the grids internally.
+            # During these states, we want to completely skip new loop ID assignment (extrusion detection)
+            # and simply synchronize our known_faces cache to keep it matching the current mesh.
+            is_interactive = (
+                getattr(active_op, 'is_grabbing', False) or
+                getattr(active_op, 'is_smoothing', False) or
+                getattr(active_op, 'is_drawing', False)
+            )
+            
+            if is_interactive:
+                active_op.known_faces = current_keys
+            else:
+                known_faces = getattr(active_op, 'known_faces', None)
+                if known_faces is None:
+                    active_op.known_faces = current_keys
+                else:
+                    # Check if any faces were deleted/removed (e.g. during grid reconstruction, undo/redo, or vertex weld/merge)
+                    deleted_keys = known_faces - current_keys
+                    
+                    # We only detect extrusion (new loop ID assignment) if:
+                    # 1. New faces were added (new_keys is not empty)
+                    # 2. NO faces were deleted/removed (deleted_keys is empty, i.e., pure addition)
+                    if not deleted_keys:
+                        # Clean up known_faces FIRST to remove signatures of deleted faces.
+                        # This prevents index reuse/collision bugs where newly created faces get
+                        # the same vertex index signatures as previously deleted faces.
+                        active_op.known_faces = active_op.known_faces.intersection(current_keys)
+                        known_faces = active_op.known_faces
+                        
+                        new_keys = current_keys - known_faces
+                        if new_keys:
+                            new_faces = [f for f in bm.faces if get_face_sig(f) in new_keys]
+                            should_assign_new = False
+                            for f in new_faces:
+                                if f[grid_layer] == 0:
+                                    should_assign_new = True
+                                    break
+                                for e in f.edges:
+                                    for adj_f in e.link_faces:
+                                        if adj_f != f and get_face_sig(adj_f) in known_faces:
+                                            if f[grid_layer] == adj_f[grid_layer]:
+                                                should_assign_new = True
+                                                break
+                                    if should_assign_new:
+                                        break
+                                        
+                            if should_assign_new:
+                                existing_lids = set()
+                                for f in bm.faces:
+                                    if get_face_sig(f) not in new_keys:
+                                        existing_lids.add(f[grid_layer])
+                                existing_lids.discard(0)
+                                new_lid = max(existing_lids) + 1 if existing_lids else 1
+                                
+                                changed_faces = False
+                                for f in new_faces:
+                                    f[grid_layer] = new_lid
+                                    changed_faces = True
+                                    
+                                if changed_faces:
+                                    bmesh.update_edit_mesh(topo_obj.data)
+                            active_op.known_faces.update(new_keys)
+                    else:
+                        # If faces were deleted, or indices shifted (e.g. undo/redo, delete, reconstruction, weld/merge),
+                        # we do NOT assign new loop IDs. We simply reset known_faces to current_keys
+                        # to keep it in sync with the new index/geometry state.
+                        active_op.known_faces = current_keys
+        except Exception as e:
+            print("Error in depsgraph handler face loop ID tracking:", e)
+        finally:
+            _in_pin_handler = False
+            
     # 1. UI State Synchronization (runs always to keep button in sync with active selection)
     is_pinned = False
     if is_edit:
@@ -5058,5 +5316,24 @@ def on_edge_length_update(self, context):
         print("Error in on_edge_length_update:", e)
     finally:
         _in_edge_length_update = False
+
+
+def on_boundary_mode_update(self, context):
+    """
+    当 tp_boundary_mode 开启时，默认进入编辑模式下的边模式。
+    """
+    topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+    if not topo_obj:
+        return
+    
+    # 只有当拓扑在运行中且拓扑对象处于编辑模式时才更改模式
+    if context.window_manager.tp_topology_running and topo_obj.mode == 'EDIT':
+        try:
+            if context.scene.tp_boundary_mode:
+                context.scene.tool_settings.mesh_select_mode = (False, True, False)
+            else:
+                context.scene.tool_settings.mesh_select_mode = (True, False, False)
+        except Exception as e:
+            print("Error in on_boundary_mode_update:", e)
 
 

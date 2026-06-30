@@ -1242,7 +1242,7 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor
     # 1. 寻找最小环基 (MCB)
     raw_cycles = find_minimum_cycle_basis(bm, comp_verts, comp_edges)
     if not raw_cycles:
-        return 0
+        return 0, 0, 0
     cycles = [set(c) for c in raw_cycles]
     
     no_auto_layer = bm.edges.layers.int.get("tp_no_auto_fill")
@@ -1342,7 +1342,7 @@ def fill_non_linear_loops(bm, comp, ref_obj, topo_obj, iterations, spring_factor
         cycles_verts[idx] = loop_verts
         
     if not active_indices:
-        return 0
+        return 0, 0, 0
         
     # 寻找共享边界
     shared_boundaries = []
@@ -1896,6 +1896,10 @@ def optimize_grid(grid_coords, M, N, ref_obj, topo_obj, iterations=40, spring_fa
         loop_sequence.append(current_bnd)
         
     ideal_loop = loop_sequence[-1]
+    # Fallback to target_loop if the Curve Shortening Flow collapsed the boundary
+    # (typically due to extreme pinch or self-intersection after weld/merge)
+    if curr_perim < 0.05 * perimeter:
+        ideal_loop = target_loop
 
     # 5. 鐢熸垚鐞嗘兂杈圭晫涓嬬殑鏃犱氦鍙夊垵濮嬬綉鏍?(Ideal Coons Patch)
     def set_grid_boundary(coords, bnd_loop):
@@ -2653,7 +2657,19 @@ def update_last_grid(context, IDs_to_adjust=None, is_interactive=False):
         except Exception:
             loop_verts = []
             
-        if not loop_verts:
+        # Check boundary vertex degrees in boundary graph to detect pinch points (degree != 2)
+        bnd_adj = {v: [] for v in V_boundary}
+        for e in E_boundary:
+            v1, v2 = e.verts
+            bnd_adj[v1].append(v2)
+            bnd_adj[v2].append(v1)
+            
+        is_pinched = any(len(neighbors) != 2 for neighbors in bnd_adj.values())
+        
+        if not loop_verts or len(loop_verts) < len(V_boundary) or is_pinched:
+            # Skip non-disk topologies (rings/annuli) and pinched loops.
+            # Note: V_internal may legitimately be empty for 1-row/column strip grids
+            # (all vertices lie on the boundary), so we do NOT skip those here.
             continue
             
         # Extract existing M, N, offset

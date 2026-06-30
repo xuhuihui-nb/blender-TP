@@ -18,6 +18,18 @@ def get_shader():
         except Exception:
             return None
 
+def get_shader_points():
+    try:
+        return gpu.shader.from_builtin('POINT_UNIFORM_COLOR')
+    except Exception:
+        try:
+            return gpu.shader.from_builtin('UNIFORM_COLOR')
+        except Exception:
+            try:
+                return gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+            except Exception:
+                return None
+
 def get_shader_2d():
     try:
         return gpu.shader.from_builtin('2D_UNIFORM_COLOR')
@@ -26,6 +38,101 @@ def get_shader_2d():
             return gpu.shader.from_builtin('UNIFORM_COLOR')
         except Exception:
             return None
+
+_polyline_shader = None
+_is_polyline = False
+_polyline_initialized = False
+
+def get_polyline_info():
+    global _polyline_shader, _is_polyline, _polyline_initialized
+    if not _polyline_initialized:
+        _polyline_initialized = True
+        try:
+            _polyline_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+            _is_polyline = True
+        except Exception:
+            try:
+                _polyline_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+                _is_polyline = False
+            except Exception:
+                try:
+                    _polyline_shader = gpu.shader.from_builtin('3D_UNIFORM_COLOR')
+                    _is_polyline = False
+                except Exception:
+                    _polyline_shader = None
+                    _is_polyline = False
+    return _polyline_shader, _is_polyline
+
+def draw_lines_smooth(coords, color, width, shader, is_polyline=False, draw_type='LINES'):
+    if not coords or shader is None:
+        return
+    
+    shader.bind()
+    
+    try:
+        gpu.state.blend_set('ALPHA')
+    except Exception:
+        pass
+        
+    if is_polyline:
+        try:
+            shader.uniform_float("viewportSize", gpu.state.viewport_get()[2:])
+            shader.uniform_float("lineWidth", width)
+            shader.uniform_float("color", color)
+        except Exception:
+            pass
+    else:
+        try:
+            shader.uniform_float("color", color)
+        except Exception:
+            pass
+        try:
+            gpu.state.line_width_set(width)
+        except Exception:
+            pass
+            
+    try:
+        batch = batch_for_shader(shader, draw_type, {"pos": coords})
+        batch.draw(shader)
+    except Exception as e:
+        print(f"Error drawing smooth lines ({draw_type}):", e)
+        
+    try:
+        gpu.state.blend_set('NONE')
+    except Exception:
+        pass
+
+def draw_smooth_circle_2d(cx, cy, radius, color, shader2d, poly_shader=None, is_poly=False):
+    # 1. Draw the filled inner part of the circle
+    inner_radius = max(0.1, radius - 1.0)
+    num_segments = 32
+    coords = []
+    for i in range(num_segments):
+        theta1 = 2.0 * math.pi * i / num_segments
+        theta2 = 2.0 * math.pi * (i + 1) / num_segments
+        coords.append((cx, cy))
+        coords.append((cx + inner_radius * math.cos(theta1), cy + inner_radius * math.sin(theta1)))
+        coords.append((cx + inner_radius * math.cos(theta2), cy + inner_radius * math.sin(theta2)))
+    
+    if shader2d:
+        shader2d.bind()
+        shader2d.uniform_float("color", color)
+        try:
+            batch_circle = batch_for_shader(shader2d, 'TRIS', {"pos": coords})
+            batch_circle.draw(shader2d)
+        except Exception:
+            pass
+
+    # 2. Draw the smooth outline circle to anti-alias the edge
+    if poly_shader:
+        border_coords = []
+        for i in range(num_segments + 1):
+            theta = 2.0 * math.pi * i / num_segments
+            border_coords.append((cx + (radius - 0.5) * math.cos(theta), cy + (radius - 0.5) * math.sin(theta), 0.0))
+        
+        draw_lines_smooth(border_coords, color, 1.5, poly_shader, is_poly, 'LINE_STRIP')
+
+_diag_logged = False
 
 def get_seam_target_edges_local(bm):
     target_edges = set()
@@ -79,30 +186,11 @@ def draw_callback(self, context):
                         
         resampled_pts, resampled_snaps = self.resample_stroke_segments(context, self.stroke_points, self.stroke_snap_indices, is_closed)
         
-        shader = get_shader()
-        if shader:
-            shader.bind()
-            shader.uniform_float("color", (1.0, 0.6, 0.0, 1.0))
-            try:
-                gpu.state.line_width_set(3.0)
-            except Exception:
-                pass
+        self._last_resampled_pts = resampled_pts
+        poly_shader, is_poly = get_polyline_info()
+        if poly_shader:
             coords = [tuple(p) for p in resampled_pts]
-            try:
-                batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
-                batch.draw(shader)
-            except Exception as e:
-                print("TP Topology Draw Error:", e)
-                
-            try:
-                gpu.state.point_size_set(6.0)
-            except Exception:
-                pass
-            try:
-                batch_dots = batch_for_shader(shader, 'POINTS', {"pos": coords})
-                batch_dots.draw(shader)
-            except Exception:
-                pass
+            draw_lines_smooth(coords, (1.0, 0.6, 0.0, 1.0), 3.0, poly_shader, is_poly, 'LINE_STRIP')
 
     # 2. Draw rubber-band preview line for polyline mode
     if not self.is_dragging and self.stroke_points and self.is_polyline:
@@ -112,23 +200,122 @@ def draw_callback(self, context):
             preview_pt = self.get_surface_point(context, coord)
             
         if preview_pt:
-            shader = get_shader()
-            if shader:
-                shader.bind()
-                shader.uniform_float("color", (1.0, 1.0, 1.0, 0.6))
-                try:
-                    gpu.state.line_width_set(2.0)
-                except Exception:
-                    pass
+            poly_shader, is_poly = get_polyline_info()
+            if poly_shader:
                 coords = [tuple(self.stroke_points[-1]), tuple(preview_pt)]
+                draw_lines_smooth(coords, (1.0, 1.0, 1.0, 0.6), 2.0, poly_shader, is_poly, 'LINE_STRIP')
+
+    # 3. Draw boundary edges overlay in 3D in boundary mode
+    if getattr(context.scene, "tp_boundary_mode", True):
+        topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+        if topo_obj and topo_obj.type == 'MESH':
+            is_grabbing = getattr(self, 'is_grabbing', False)
+            grab_weights = getattr(self, 'grab_weights', {}) if is_grabbing else {}
+
+            # Each entry: (p1, p2, weight)  weight=-1 means "selected/active orange"
+            unselected_edges = []  # (p1, p2)
+            selected_edges   = []  # (p1, p2)
+            # During grab: (p1, p2, alpha) for influenced white→orange edges
+            influenced_edges = []  # (p1, p2, alpha)
+
+            matrix_world = topo_obj.matrix_world
+            is_edit = (topo_obj.mode == 'EDIT')
+            if is_edit:
                 try:
-                    batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
-                    batch.draw(shader)
+                    bm = bmesh.from_edit_mesh(topo_obj.data)
+                    target_edges = get_seam_target_edges_local(bm)
+                    for e in target_edges:
+                        p1 = matrix_world @ e.verts[0].co
+                        p2 = matrix_world @ e.verts[1].co
+                        is_sel = e.select
+                        if is_sel:
+                            selected_edges.append((p1, p2))
+                        else:
+                            unselected_edges.append((p1, p2))
+                            if is_grabbing and grab_weights:
+                                w0 = grab_weights.get(e.verts[0].index, 0.0)
+                                w1 = grab_weights.get(e.verts[1].index, 0.0)
+                                w = max(w0, w1)
+                                if w > 0.0:
+                                    influenced_edges.append((p1, p2, w))
+                except Exception as e:
+                    print("Error getting edit mesh boundary edges:", e)
+            else:
+                try:
+                    mesh = topo_obj.data
+                    bm = bmesh.new()
+                    bm.from_mesh(mesh)
+                    target_edges = get_seam_target_edges_local(bm)
+                    for e in target_edges:
+                        p1 = matrix_world @ e.verts[0].co
+                        p2 = matrix_world @ e.verts[1].co
+                        is_sel = e.select
+                        if is_sel:
+                            selected_edges.append((p1, p2))
+                        else:
+                            unselected_edges.append((p1, p2))
+                            if is_grabbing and grab_weights:
+                                w0 = grab_weights.get(e.verts[0].index, 0.0)
+                                w1 = grab_weights.get(e.verts[1].index, 0.0)
+                                w = max(w0, w1)
+                                if w > 0.0:
+                                    influenced_edges.append((p1, p2, w))
+                    bm.free()
+                except Exception as e:
+                    print("Error getting mesh boundary edges:", e)
+
+            poly_shader, is_poly = get_polyline_info()
+            if poly_shader and (unselected_edges or selected_edges or influenced_edges):
+                orig_depth_test = 'NONE'
+                try:
+                    orig_depth_test = gpu.state.depth_test_get()
+                    if topo_obj.show_in_front:
+                        gpu.state.depth_test_set('NONE')
+                    else:
+                        gpu.state.depth_test_set('LESS_EQUAL')
                 except Exception:
                     pass
 
-    # 3. Draw pinned boundary vertices/edges overlay
-    if context.scene.tp_pin_boundary:
+                # 1. Draw unaffected boundary edges (white)
+                if unselected_edges:
+                    coords = []
+                    for p1, p2 in unselected_edges:
+                        coords.append(tuple(p1))
+                        coords.append(tuple(p2))
+                    draw_lines_smooth(coords, (1.0, 1.0, 1.0, 1.0), 4.0, poly_shader, is_poly, 'LINES')
+
+                # 2. Draw selected boundary edges (orange, fully opaque)
+                if selected_edges:
+                    coords = []
+                    for p1, p2 in selected_edges:
+                        coords.append(tuple(p1))
+                        coords.append(tuple(p2))
+                    draw_lines_smooth(coords, (1.0, 0.6, 0.0, 1.0), 4.0, poly_shader, is_poly, 'LINES')
+
+                # 3. During grab: draw influence-weighted orange edges
+                if influenced_edges:
+                    from collections import defaultdict
+                    buckets = defaultdict(list)
+                    for p1, p2, w in influenced_edges:
+                        bucket = round(w * 16) / 16
+                        buckets[bucket].append((p1, p2))
+                    for alpha, pairs in buckets.items():
+                        coords = []
+                        for p1, p2 in pairs:
+                            coords.append(tuple(p1))
+                            coords.append(tuple(p2))
+                        draw_lines_smooth(coords, (1.0, 0.6, 0.0, alpha), 4.0, poly_shader, is_poly, 'LINES')
+
+                # Restore original depth test state
+                try:
+                    gpu.state.depth_test_set(orig_depth_test)
+                except Exception:
+                    pass
+
+
+    # 4. Draw pinned boundary vertices/edges overlay
+    # Draw it always to ensure pinned edges stay visible even when the selection changes
+    if True:
         topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
         if topo_obj and topo_obj.type == 'MESH':
             pinned_coords = []
@@ -160,8 +347,8 @@ def draw_callback(self, context):
                         if pin_attr.data[e.vertices[0]].value == 1 and pin_attr.data[e.vertices[1]].value == 1:
                             pinned_edges.append((matrix_world @ mesh.vertices[e.vertices[0]].co, matrix_world @ mesh.vertices[e.vertices[1]].co))
             
-            shader = get_shader()
-            if shader and (pinned_coords or pinned_edges):
+            poly_shader, is_poly = get_polyline_info()
+            if poly_shader and (pinned_coords or pinned_edges):
                 orig_depth_test = 'NONE'
                 try:
                     orig_depth_test = gpu.state.depth_test_get()
@@ -172,37 +359,13 @@ def draw_callback(self, context):
                 except Exception:
                     pass
 
-                shader.bind()
-                # Yellow color: (1.0, 0.9, 0.0, 1.0)
-                shader.uniform_float("color", (1.0, 0.9, 0.0, 1.0))
-                
                 # 1. Always draw edges (lines) if they exist
                 if pinned_edges:
-                    try:
-                        gpu.state.line_width_set(4.0)
-                    except Exception:
-                        pass
                     coords = []
                     for p1, p2 in pinned_edges:
                         coords.append(tuple(p1))
                         coords.append(tuple(p2))
-                    try:
-                        batch_pinned_edges = batch_for_shader(shader, 'LINES', {"pos": coords})
-                        batch_pinned_edges.draw(shader)
-                    except Exception:
-                        pass
-                
-                # 2. Always draw points (dots) if they exist
-                if pinned_coords:
-                    try:
-                        gpu.state.point_size_set(10.0)
-                    except Exception:
-                        pass
-                    try:
-                        batch_pinned = batch_for_shader(shader, 'POINTS', {"pos": [tuple(p) for p in pinned_coords]})
-                        batch_pinned.draw(shader)
-                    except Exception:
-                        pass
+                    draw_lines_smooth(coords, (1.0, 0.9, 0.0, 1.0), 4.0, poly_shader, is_poly, 'LINES')
 
                 # Restore original depth test state
                 try:
@@ -210,136 +373,156 @@ def draw_callback(self, context):
                 except Exception:
                     pass
 
-    # 4. Draw boundary edges overlay (white edges) in boundary mode
-    if getattr(context.scene, "tp_boundary_mode", True):
+
+def draw_text_callback(self, context):
+    # 0. Draw the active stroke dots in real-time as smooth 2D circles
+    resampled_pts = getattr(self, '_last_resampled_pts', None)
+    if resampled_pts and self.stroke_points and len(self.stroke_points) >= 2:
+        region = context.region
+        rv3d = context.space_data.region_3d
+        shader2d = get_shader_2d()
+        poly_shader, is_poly = get_polyline_info()
+        for p in resampled_pts:
+            screen_coord = location_3d_to_region_2d(region, rv3d, p)
+            if screen_coord:
+                cx, cy = screen_coord[0], screen_coord[1]
+                draw_smooth_circle_2d(cx, cy, 3.0, (1.0, 0.6, 0.0, 1.0), shader2d, poly_shader, is_poly)
+
+    # 0.1. Draw boundary smoothing brush indicator
+    is_boundary_mode = getattr(context.scene, "tp_boundary_mode", True)
+    shift_held = getattr(self, 'shift_pressed', False)
+    if getattr(self, 'is_smoothing', False) or (is_boundary_mode and shift_held):
+        cx, cy = self.last_mouse_coord[0], self.last_mouse_coord[1]
+        poly_shader, is_poly = get_polyline_info()
+        if poly_shader:
+            radius = getattr(self, 'smooth_brush_radius', 50.0)
+            num_segments = 32
+            circle_coords = []
+            for i in range(num_segments + 1):
+                theta = 2.0 * math.pi * i / num_segments
+                circle_coords.append((cx + radius * math.cos(theta), cy + radius * math.sin(theta), 0.0))
+            draw_lines_smooth(circle_coords, (1.0, 1.0, 1.0, 1.0), 4.0, poly_shader, is_poly, 'LINE_STRIP')
+
+    # 0.5. Draw selected boundary vertices and pinned vertices
+    if True:
         topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
         if topo_obj and topo_obj.type == 'MESH':
-            boundary_edges = []
-            matrix_world = topo_obj.matrix_world
             is_edit = (topo_obj.mode == 'EDIT')
-            
+            is_boundary_mode = getattr(context.scene, "tp_boundary_mode", True)
+            unpinned_selected_co = []
+            pinned_isolated_co = []
+            pinned_continuous_co = []
             if is_edit:
                 try:
                     bm = bmesh.from_edit_mesh(topo_obj.data)
                     target_edges = get_seam_target_edges_local(bm)
-                    for e in target_edges:
-                        boundary_edges.append((matrix_world @ e.verts[0].co, matrix_world @ e.verts[1].co))
+                    boundary_verts = {v for e in target_edges for v in e.verts}
+                    
+                    global _diag_logged
+                    if not _diag_logged:
+                        _diag_logged = True
+                        try:
+                            with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                                f_log.write(f"[draw_text_success] total_verts={len(bm.verts)}, target_edges={len(target_edges)}, boundary_verts={[v.index for v in boundary_verts]}, selected={[v.index for v in bm.verts if v.select]}\n")
+                        except Exception:
+                            pass
+                            
+                    pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+                    for v in boundary_verts:
+                        co = topo_obj.matrix_world @ v.co
+                        is_pinned = pin_layer and (v[pin_layer] == 1)
+                        if is_pinned:
+                            # Check if this pinned vertex is isolated (no pinned neighbors)
+                            is_isolated_pin = True
+                            if pin_layer:
+                                for e in v.link_edges:
+                                    if e.other_vert(v)[pin_layer] == 1:
+                                        is_isolated_pin = False
+                                        break
+                            if is_isolated_pin:
+                                pinned_isolated_co.append(co)
+                            else:
+                                pinned_continuous_co.append(co)
+                        elif is_boundary_mode and v.select:
+                            # Only draw as white dot if none of the neighbor vertices in BMesh are selected
+                            is_isolated = not any(e.other_vert(v).select for e in v.link_edges)
+                            if is_isolated:
+                                unpinned_selected_co.append(co)
                 except Exception as e:
-                    print("Error getting edit mesh boundary edges:", e)
+                    try:
+                        with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                            import traceback
+                            f_log.write(f"[draw_text] Error: {e}\n{traceback.format_exc()}\n")
+                    except:
+                        pass
+
             else:
                 try:
                     mesh = topo_obj.data
                     bm = bmesh.new()
                     bm.from_mesh(mesh)
                     target_edges = get_seam_target_edges_local(bm)
-                    for e in target_edges:
-                        boundary_edges.append((matrix_world @ e.verts[0].co, matrix_world @ e.verts[1].co))
+                    boundary_verts = {v for e in target_edges for v in e.verts}
+                    pin_attr = mesh.attributes.get("tp_is_pinned")
+                    for v in boundary_verts:
+                        co = topo_obj.matrix_world @ v.co
+                        is_pinned = pin_attr and (pin_attr.data[v.index].value == 1)
+                        if is_pinned:
+                            # Check if this pinned vertex is isolated (no pinned neighbors)
+                            is_isolated_pin = True
+                            if pin_attr:
+                                for e in v.link_edges:
+                                    if pin_attr.data[e.other_vert(v).index].value == 1:
+                                        is_isolated_pin = False
+                                        break
+                            if is_isolated_pin:
+                                pinned_isolated_co.append(co)
+                            else:
+                                pinned_continuous_co.append(co)
+                        elif is_boundary_mode and v.select:
+                            # Only draw as white dot if none of the neighbor vertices in BMesh are selected
+                            is_isolated = not any(e.other_vert(v).select for e in v.link_edges)
+                            if is_isolated:
+                                unpinned_selected_co.append(co)
                     bm.free()
                 except Exception as e:
-                    print("Error getting mesh boundary edges:", e)
-            
-            shader = get_shader()
-            if shader and boundary_edges:
-                orig_depth_test = 'NONE'
-                try:
-                    orig_depth_test = gpu.state.depth_test_get()
-                    if topo_obj.show_in_front:
-                        gpu.state.depth_test_set('NONE')
-                    else:
-                        gpu.state.depth_test_set('LESS_EQUAL')
-                except Exception:
-                    pass
+                    print("Error getting mesh boundary verts for 2D draw:", e)
+            if unpinned_selected_co or pinned_isolated_co:
+                region = context.region
+                rv3d = context.space_data.region_3d
+                shader2d = get_shader_2d()
+                poly_shader, is_poly = get_polyline_info()
+                if shader2d:
+                    # Draw unpinned selected vertices: white dot (r=8) + green center dot (r=4)
+                    for world_co in unpinned_selected_co:
+                        screen_coord = location_3d_to_region_2d(region, rv3d, world_co)
+                        if screen_coord:
+                            cx, cy = screen_coord[0], screen_coord[1]
+                            # Layer 1: white base dot
+                            draw_smooth_circle_2d(cx, cy, 8.0, (1.0, 1.0, 1.0, 1.0), shader2d, poly_shader, is_poly)
+                            # Layer 2: green center dot (darker green)
+                            draw_smooth_circle_2d(cx, cy, 4.0, (0.0, 0.6, 0.3, 1.0), shader2d, poly_shader, is_poly)
 
-                shader.bind()
-                # Pure White color: (1.0, 1.0, 1.0, 1.0)
-                shader.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
-                try:
-                    gpu.state.line_width_set(4.0)
-                except Exception:
-                    pass
-                coords = []
-                for p1, p2 in boundary_edges:
-                    coords.append(tuple(p1))
-                    coords.append(tuple(p2))
-                try:
-                    batch_boundary_edges = batch_for_shader(shader, 'LINES', {"pos": coords})
-                    batch_boundary_edges.draw(shader)
-                except Exception as e:
-                    print("Error drawing boundary edges:", e)
-                finally:
-                    # Restore original depth test state
-                    try:
-                        gpu.state.depth_test_set(orig_depth_test)
-                    except Exception:
-                        pass
+                    # Draw isolated pinned vertices: white dot (r=12) base + orange dot (r=6) overlay
+                    for world_co in pinned_isolated_co:
+                        screen_coord = location_3d_to_region_2d(region, rv3d, world_co)
+                        if screen_coord:
+                            cx, cy = screen_coord[0], screen_coord[1]
+                            # Layer 1: white base dot (same as selected but larger)
+                            draw_smooth_circle_2d(cx, cy, 12.0, (1.0, 1.0, 1.0, 1.0), shader2d, poly_shader, is_poly)
+                            # Layer 2: orange snap-style dot on top (larger)
+                            draw_smooth_circle_2d(cx, cy, 6.0, (1.0, 0.6, 0.0, 1.0), shader2d, poly_shader, is_poly)
 
-def draw_text_callback(self, context):
-    # 0. Draw boundary smoothing brush indicator
-    is_boundary_mode = getattr(context.scene, "tp_boundary_mode", True)
-    alt_held = getattr(self, 'alt_pressed', False)
-    if getattr(self, 'is_smoothing', False) or (is_boundary_mode and alt_held):
-        cx, cy = self.last_mouse_coord[0], self.last_mouse_coord[1]
-        shader = get_shader_2d()
-        if shader:
-            shader.bind()
-            radius = getattr(self, 'smooth_brush_radius', 50.0)
-            num_segments = 32
-            
-            # White color: (1.0, 1.0, 1.0, 1.0)
-            shader.uniform_float("color", (1.0, 1.0, 1.0, 1.0))
-            
-            circle_coords = []
-            for i in range(num_segments + 1):
-                theta = 2.0 * math.pi * i / num_segments
-                circle_coords.append((cx + radius * math.cos(theta), cy + radius * math.sin(theta)))
-            
-            try:
-                gpu.state.line_width_set(4.0)
-            except Exception:
-                pass
-            try:
-                batch_circle = batch_for_shader(shader, 'LINE_STRIP', {"pos": circle_coords})
-                batch_circle.draw(shader)
-            except Exception:
-                pass
-
-    # 1. Draw hover snap point indicator
+    # 2. Draw hover snap point indicator
     if self.hover_snap_pt:
         region = context.region
         rv3d = context.space_data.region_3d
         screen_coord = location_3d_to_region_2d(region, rv3d, self.hover_snap_pt)
         if screen_coord:
             cx, cy = screen_coord[0], screen_coord[1]
-            shader = get_shader_2d()
-            if shader:
-                shader.bind()
-                shader.uniform_float("color", (0.0, 1.0, 0.2, 1.0))
-                
-                num_segments = 16
-                circle_coords = []
-                for i in range(num_segments):
-                    theta = 2.0 * math.pi * i / num_segments
-                    circle_coords.append((cx + 6.0 * math.cos(theta), cy + 6.0 * math.sin(theta)))
-                    
-                try:
-                    gpu.state.line_width_set(3.0)
-                except Exception:
-                    pass
-                try:
-                    batch_circle = batch_for_shader(shader, 'LINE_LOOP', {"pos": circle_coords})
-                    batch_circle.draw(shader)
-                except Exception:
-                    pass
-                    
-                try:
-                    gpu.state.point_size_set(6.0)
-                except Exception:
-                    pass
-                try:
-                    batch_dot = batch_for_shader(shader, 'POINTS', {"pos": [(cx, cy)]})
-                    batch_dot.draw(shader)
-                except Exception:
-                    pass
+            shader2d = get_shader_2d()
+            poly_shader, is_poly = get_polyline_info()
+            draw_smooth_circle_2d(cx, cy, 4.0, (1.0, 0.6, 0.0, 1.0), shader2d, poly_shader, is_poly)
 
     # 2. If actively drawing/placing: show point count
     if self.is_drawing and self.stroke_points:
@@ -419,21 +602,10 @@ def draw_text_callback(self, context):
 
     # 4. Draw 2D straight line guide for outside drag
     if getattr(self, 'is_outside_drawing', False):
-        shader = get_shader_2d()
-        if shader:
-            shader.bind()
-            shader.uniform_float("color", (1.0, 0.6, 0.0, 0.8))
-            try:
-                gpu.state.line_width_set(3.0)
-            except Exception:
-                pass
-            
+        poly_shader, is_poly = get_polyline_info()
+        if poly_shader:
             start_coord = self.drag_start_coord
             end_coord = self.last_mouse_coord
-            coords = [start_coord, end_coord]
-            try:
-                batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
-                batch.draw(shader)
-            except Exception:
-                pass
+            coords = [(start_coord[0], start_coord[1], 0.0), (end_coord[0], end_coord[1], 0.0)]
+            draw_lines_smooth(coords, (1.0, 0.6, 0.0, 0.8), 3.0, poly_shader, is_poly, 'LINE_STRIP')
 

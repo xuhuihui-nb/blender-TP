@@ -1,7 +1,7 @@
 bl_info = {
     "name": "TP拓扑",
     "author": "Antigravity",
-    "version": (2, 1, 0),
+    "version": (2, 1, 1),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > TP拓扑",
     "description": "在被选网格对象表面绘制连续拓扑线的工具",
@@ -33,10 +33,16 @@ classes = (
     op_grid_fill.OBJECT_OT_tp_topology_grid_fill,
     op_grid_fill.OBJECT_OT_tp_topology_remove_grid,
     ui.OBJECT_OT_tp_topology_auto_outline,
+    ui.OBJECT_OT_tp_set_fixed_point_count,
     ui.VIEW3D_PT_tp_topology,
 )
 
 def register():
+    try:
+        with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f:
+            f.write("--- TP Addon Registered (Version 2.1.1) ---\n")
+    except:
+        pass
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.WindowManager.tp_topology_running = bpy.props.BoolProperty(default=False)
@@ -74,7 +80,8 @@ def register():
     bpy.types.Scene.tp_boundary_mode = bpy.props.BoolProperty(
         name="边界",
         description="显示白边外圈并允许拖拽调整栅格",
-        default=True
+        default=True,
+        update=op_draw.on_boundary_mode_update
     )
     bpy.types.Scene.tp_smooth_strength = bpy.props.FloatProperty(
         name="平滑力度",

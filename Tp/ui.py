@@ -10,6 +10,23 @@ class OBJECT_OT_tp_topology_auto_outline(bpy.types.Operator):
         self.report({'INFO'}, "生成结构线功能暂未实现")
         return {'FINISHED'}
 
+class OBJECT_OT_tp_set_fixed_point_count(bpy.types.Operator):
+    bl_idname = "object.tp_set_fixed_point_count"
+    bl_label = "设置固定点数"
+    bl_description = "快速设置固定点数"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    count: bpy.props.IntProperty(name="点数", default=0)
+
+    def execute(self, context):
+        if self.count == 0:
+            context.scene.tp_use_fixed_point_count = False
+            context.scene.tp_fixed_point_count = 0
+        else:
+            context.scene.tp_use_fixed_point_count = True
+            context.scene.tp_fixed_point_count = self.count
+        return {'FINISHED'}
+
 class VIEW3D_PT_tp_topology(bpy.types.Panel):
     bl_label = "TP拓扑"
     bl_idname = "VIEW3D_PT_tp_topology"
@@ -47,17 +64,6 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                 row_front.prop(scene, "tp_use_wrap", text="包裹", toggle=True, icon='MOD_SHRINKWRAP')
                 row_front.prop(scene, "tp_pin_boundary", text="固定", toggle=True, icon='PINNED')
                 row_front.prop(scene, "tp_seam_edge", text="缝合边", toggle=True, icon='EDGE_SEAM')
-                if scene.tp_boundary_mode:
-                    col.prop(scene, "tp_smooth_strength", text="平滑力度")
-            
-            col.separator()
-            col.prop(scene, "tp_edge_length", text="边长")
-            
-            row_point = col.row(align=True)
-            split = row_point.split(factor=0.333, align=True)
-            split.prop(scene, "tp_use_fixed_point_count", text="点的数量", toggle=True)
-            split.prop(scene, "tp_fixed_point_count", text="")
-            
             col.separator()
             row_auto = col.row(align=True)
             row_auto.scale_y = 2.0
@@ -69,13 +75,32 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
             
             # 栅格微调面板
             grid_box = col.box()
-            grid_box.label(text="栅格微调:", icon='GRID')
+            grid_box.label(text="参数调整:", icon='GRID')
+            row_point = grid_box.row(align=True)
+            split = row_point.split(factor=0.333, align=True)
+            split.prop(scene, "tp_use_fixed_point_count", text="点的数量", toggle=True)
+            split.prop(scene, "tp_fixed_point_count", text="")
+            
+            row_quick = grid_box.row(align=True)
+            for val in [0, 4, 8, 16, 32, 64, 128]:
+                is_depressed = False
+                if val == 0:
+                    is_depressed = not scene.tp_use_fixed_point_count
+                else:
+                    is_depressed = scene.tp_use_fixed_point_count and scene.tp_fixed_point_count == val
+                
+                op = row_quick.operator("object.tp_set_fixed_point_count", text=str(val), depress=is_depressed)
+                op.count = val
+                
+            if scene.tp_boundary_mode:
+                grid_box.prop(scene, "tp_smooth_strength", text="平滑力度")
+            grid_box.prop(scene, "tp_edge_length", text="边长")
             grid_box.prop(scene, "tp_grid_span", text="跨分")
             grid_box.prop(scene, "tp_grid_offset", text="偏移")
             
             col.separator()
             row2 = col.row(align=True)
-            row2.prop(scene, "tp_auto_grid_fill", text="栅格", toggle=True, icon='GRID')
+            row2.prop(scene, "tp_auto_grid_fill", text="自动栅格", toggle=True, icon='GRID')
             row2.operator(
                 "object.tp_topology_grid_fill",
                 text="栅格填充",
@@ -130,8 +155,11 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                     
                     col_t.separator()
                     col_t.label(text="【边界交互 (白线)】", icon='EDGESEL')
-                    col_t.label(text="• 边界拖动: 【边界】模式下，左键直接在白线顶点/边附近拖动可实时改变边界")
-                    col_t.label(text="• 边界平滑: 【边界】模式下，按住 Alt + 左键拖动，可用圆形笔刷实时平滑白线")
+                    col_t.label(text="• 自动模式: 启用【边界】交互模式时，自动切换为网格“边选择”模式，操作更直观")
+                    col_t.label(text="• 边界选择: 【边界】模式下，左键单击白线顶点或边可选中/取消选择该元素；按住 Shift + 左键可加选/减选单个顶点或边；按住 Alt + 左键点击则可选择循环边")
+                    col_t.label(text="• 边界拖动: 【边界】模式下，左键直接在白线顶点/边附近拖动可实时改变边界 (拖动时将自动选择当前顶点并取消选择其他元素)")
+                    col_t.label(text="• 双击固定: 【边界】模式下，双击白线顶点可单独固定/取消固定该点 (非连续固定点显示为橙黄色大圆点，连续固定点显示为黄色边)")
+                    col_t.label(text="• 边界平滑: 【边界】模式下，按住 Shift + 左键拖动，可用圆形笔刷实时平滑白线")
                     col_t.label(text="• 元素隔离: 【边界】模式下，内部栅格元素将不可选，防止意外选中或误操作")
                     col_t.label(text="• 安全吸附: 边界点吸附时，只吸附白线顶点，且防止鼠标穿透网格吸附到背面")
                     
@@ -170,8 +198,11 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                     
                     col_t.separator()
                     col_t.label(text="【Boundary Interaction (White Lines)】", icon='EDGESEL')
-                    col_t.label(text="• Drag Boundary: Under [Boundary] mode, drag LMB near white boundary vertices/edges to adjust boundary shape")
-                    col_t.label(text="• Smooth Boundary: Under [Boundary] mode, hold Alt + drag LMB to smooth white lines using a circular brush")
+                    col_t.label(text="• Auto Mode: Enabling [Boundary] mode automatically switches Blender to [Edge Select] mode for easier interaction")
+                    col_t.label(text="• Boundary Selection: Under [Boundary] mode, click LMB on a white boundary vertex or edge to select/deselect it (Shift + LMB to toggle select individual vertex or edge), or hold Alt + LMB to select loops")
+                    col_t.label(text="• Drag Boundary: Under [Boundary] mode, drag LMB near white boundary vertices/edges to adjust boundary shape (automatically selects the dragged vertex and deselects other vertices)")
+                    col_t.label(text="• Double-Click Pin: Under [Boundary] mode, double-click a white boundary vertex to pin/unpin it individually (isolated pinned points display as large orange-yellow dots, continuous pinned edges display as yellow lines)")
+                    col_t.label(text="• Smooth Boundary: Under [Boundary] mode, hold Shift + drag LMB to smooth white lines using a circular brush")
                     col_t.label(text="• Element Isolation: Under [Boundary] mode, internal grid elements are locked/unselectable to prevent errors")
                     col_t.label(text="• Safe Snapping: Snaps only to other boundary vertices, preventing cursor from penetrating the mesh")
                     
