@@ -64,6 +64,15 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                 row_front.prop(scene, "tp_use_wrap", text="包裹", toggle=True, icon='MOD_SHRINKWRAP')
                 row_front.prop(scene, "tp_pin_boundary", text="固定", toggle=True, icon='PINNED')
                 row_front.prop(scene, "tp_seam_edge", text="缝合边", toggle=True, icon='EDGE_SEAM')
+                
+                row_sym = col.row(align=True)
+                row_sym.prop(scene, "tp_symmetry_mode", text="对称", toggle=True, icon='MOD_MIRROR')
+                row_sym.operator("object.tp_apply_symmetry", text="确认")
+                sub_row = row_sym.row(align=True)
+                sub_row.enabled = scene.tp_symmetry_mode
+                sub_row.prop(scene, "tp_symmetry_x", text="X", toggle=True)
+                sub_row.prop(scene, "tp_symmetry_y", text="Y", toggle=True)
+                sub_row.prop(scene, "tp_symmetry_z", text="Z", toggle=True)
             col.separator()
             row_auto = col.row(align=True)
             row_auto.scale_y = 2.0
@@ -152,6 +161,7 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                     col_t.label(text="• 固定点数: 勾选【点的数量】并设数值，将固定顶点数绘制")
                     col_t.label(text="• 最前与包裹: 开启【最前显示】便于观察，【包裹】使点自动贴合高模")
                     col_t.label(text="• 锁定边界: 开启【固定】可锁定边界顶点；若选点则仅锁定选中点")
+                    col_t.label(text="• 对称与确认: 开启【对称】进行镜像拓扑；点击【确认】可应用镜像并自动退出对称状态")
                     
                     col_t.separator()
                     col_t.label(text="【边界交互 (白线)】", icon='EDGESEL')
@@ -195,6 +205,7 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
                     col_t.label(text="• Fixed Point Count: Enable [Number of Points] and set value to draw with fixed vertices")
                     col_t.label(text="• In Front & Wrap: Enable [In Front] for visibility, [Wrap] to automatically snap vertices to the high-poly surface")
                     col_t.label(text="• Lock Boundary: Enable [Pin] to lock boundary vertices; if vertices are selected, only locks selected vertices")
+                    col_t.label(text="• Symmetry & Confirm: Enable [Symmetry] to mirror topology; click [Confirm] to apply mirror and exit symmetry mode")
                     
                     col_t.separator()
                     col_t.label(text="【Boundary Interaction (White Lines)】", icon='EDGESEL')

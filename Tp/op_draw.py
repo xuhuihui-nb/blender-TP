@@ -9,7 +9,7 @@ from bpy_extras.view3d_utils import (
     location_3d_to_region_2d
 )
 
-from .draw_utils import draw_callback, draw_text_callback
+from .draw_utils import draw_callback, draw_text_callback, is_point_in_mask, clamp_to_mask_boundary
 
 _active_draw_operator = None
 
@@ -124,6 +124,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
         if context.scene.tp_use_wrap:
             self.ensure_shrinkwrap_modifier(context, topo_obj)
+        update_mirror_modifier(context)
         return topo_obj
 
     def ensure_shrinkwrap_modifier(self, context, topo_obj):
@@ -202,6 +203,9 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                         topo_obj.modifiers.remove(mod)
                     except Exception:
                         pass
+                        
+            # 根据“对称”状态动态控制修改器
+            update_mirror_modifier(context)
                     
         # 强制自动合并
         if not context.scene.tool_settings.use_mesh_automerge:
@@ -899,6 +903,9 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 snap_pt, snap_v = self.find_nearest_vertex(context, coord, threshold_pixels=20)
                 pt = snap_pt if snap_pt else self.get_surface_point(context, coord)
                 if pt:
+                    if is_point_in_mask(pt, context):
+                        self.report({'WARNING'}, "无法在对称遮罩区内绘制")
+                        return {'RUNNING_MODAL'}
                     self.is_drawing = True
                     self.is_dragging = True
                     self.is_polyline = False
@@ -933,6 +940,27 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     snap_pt, snap_v = self.find_nearest_vertex(context, coord, threshold_pixels=20)
                     pt = snap_pt if snap_pt else self.get_surface_point(context, coord)
                     if pt:
+                        if is_point_in_mask(pt, context):
+                            clamped_pt = clamp_to_mask_boundary(pt, context)
+                            if (clamped_pt - self.stroke_points[-1]).length > 0.001:
+                                self.stroke_points.append(clamped_pt)
+                                self.stroke_snap_indices.append(snap_v)
+                            if len(self.stroke_points) >= 2:
+                                self.create_geometry(context)
+                                try:
+                                    bpy.ops.ed.undo_push(message="TP 拓扑绘制")
+                                    self.report({'INFO'}, "触碰遮罩区并贴合边界，已自动完成绘制")
+                                except Exception as e:
+                                    print("Error pushing undo step:", e)
+                            self.stroke_points = []
+                            self.stroke_snap_indices = []
+                            self.is_drawing = False
+                            self.is_polyline = False
+                            self.start_from_selected_v_co = None
+                            self.start_from_selected_v_idx = None
+                            context.area.tag_redraw()
+                            return {'RUNNING_MODAL'}
+
                         if (pt - self.stroke_points[-1]).length > 0.001:
                             self.stroke_points.append(pt)
                             self.stroke_snap_indices.append(snap_v)
@@ -1062,6 +1090,31 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             snap_pt, snap_v = self.find_nearest_vertex(context, coord, threshold_pixels=20)
                             pt = snap_pt if snap_pt else self.get_surface_point(context, coord)
                             if pt:
+                                if is_point_in_mask(pt, context):
+                                    clamped_pt = clamp_to_mask_boundary(pt, context)
+                                    if (clamped_pt - self.stroke_points[-1]).length > 0.001:
+                                        self.stroke_points.append(clamped_pt)
+                                        self.stroke_snap_indices.append(snap_v)
+                                    if len(self.stroke_points) >= 2:
+                                        self.create_geometry(context)
+                                        self.conform_to_surface(context)
+                                        self.rebuild_kd_tree()
+                                        try:
+                                            bpy.ops.ed.undo_push(message="TP 拓扑绘制")
+                                            self.report({'INFO'}, "触碰遮罩区并贴合边界，已自动完成绘制")
+                                        except Exception as e:
+                                            print("Error pushing undo step:", e)
+                                    self.stroke_points = []
+                                    self.stroke_snap_indices = []
+                                    self.is_drawing = False
+                                    self.is_dragging = False
+                                    self.is_polyline = False
+                                    self.start_from_selected_v_co = None
+                                    self.start_from_selected_v_idx = None
+                                    self.max_drag_dist_from_start = 0.0
+                                    context.area.tag_redraw()
+                                    return {'RUNNING_MODAL'}
+
                                 if (pt - self.stroke_points[-1]).length > 0.001:
                                     self.stroke_points.append(pt)
                                     self.stroke_snap_indices.append(snap_v)
@@ -2387,9 +2440,16 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
             if success:
                 local_pt = location + normal * 0.0005
-                v.co = topo_inverse @ (ref_matrix_world @ local_pt)
+                proposed_world_co = ref_matrix_world @ local_pt
+                if is_point_in_mask(proposed_world_co, context):
+                    pass
+                else:
+                    v.co = topo_inverse @ proposed_world_co
             else:
-                v.co = local_co
+                if is_point_in_mask(world_co, context):
+                    pass
+                else:
+                    v.co = local_co
                 
         bmesh.update_edit_mesh(topo_obj.data)
         
@@ -3614,6 +3674,51 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             curr_v = next_v
         return loop_verts
 
+    def trace_all_boundary_components(self, E_boundary):
+        """Trace ALL separate closed boundary loops from a set of edges.
+        Returns a list of vertex lists, one per connected boundary component.
+        Handles ring/annulus topology where boundary_edges form two separate loops."""
+        if not E_boundary:
+            return []
+        adj = {}
+        for e in E_boundary:
+            for v in e.verts:
+                adj.setdefault(v, []).append(e)
+
+        # Only process vertices with exactly 2 boundary edges (valid for closed loops)
+        valid_starts = [v for v, edges in adj.items() if len(edges) == 2]
+        if not valid_starts:
+            return []
+
+        visited_verts = set()
+        all_components = []
+
+        for start_v in valid_starts:
+            if start_v in visited_verts:
+                continue
+            # Trace the closed loop starting from start_v
+            loop_verts = []
+            curr_v = start_v
+            prev_edge = None
+            local_visited = set()
+            while curr_v and curr_v not in local_visited:
+                loop_verts.append(curr_v)
+                local_visited.add(curr_v)
+                next_v = None
+                for e in adj[curr_v]:
+                    if e != prev_edge:
+                        next_v = e.other_vert(curr_v)
+                        prev_edge = e
+                        break
+                if next_v == start_v:
+                    break
+                curr_v = next_v
+            if len(loop_verts) >= 3:
+                all_components.append(loop_verts)
+                visited_verts.update(loop_verts)
+
+        return all_components
+
     def find_all_loops(self, bm):
         loops = []
         grid_layer = bm.faces.layers.int.get("tp_is_grid")
@@ -3635,7 +3740,6 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     E_loop_all.update(f.edges)
                     
                 E_boundary = {e for e in E_loop_all if len([f for f in e.link_faces if f[grid_layer] == lid]) == 1}
-                ordered_verts = self.trace_boundary_loop_from_edges(bm, E_boundary)
                 V_boundary = {v for e in E_boundary for v in e.verts}
                 
                 # Check boundary vertex degrees in boundary graph to detect pinch points (degree != 2)
@@ -3647,14 +3751,65 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     
                 is_pinched = any(len(neighbors) != 2 for neighbors in bnd_adj.values())
                 
-                if ordered_verts and len(ordered_verts) >= len(V_boundary) and not is_pinched:
+                if is_pinched:
+                    # Genuinely pinched - skip
+                    continue
+                
+                # Trace all boundary components (handles both disk and ring/annulus topology)
+                all_components = self.trace_all_boundary_components(E_boundary)
+                total_traced = sum(len(c) for c in all_components)
+                
+                if not all_components:
+                    continue
+
+                if len(all_components) == 1 and total_traced >= len(V_boundary):
+                    # Simple disk topology: single boundary loop
+                    ordered_verts = all_components[0]
                     loops.append({
                         'type': 'rasterized',
                         'loop_id': lid,
                         'verts': ordered_verts,
                         'faces': F_loop
                     })
+                elif len(all_components) == 2 and total_traced >= len(V_boundary):
+                    # Ring/annulus topology: two boundary loops (inner + outer extrusion ring)
+                    # Identify the outer boundary as the one NOT shared with any other loop_id disk
+                    comp0, comp1 = all_components[0], all_components[1]
+                    comp0_set = set(comp0)
+                    comp1_set = set(comp1)
                     
+                    # The inner boundary shares verts with other loop_ids' territory
+                    # The outer boundary has edges that are pure wire or open boundary
+                    def component_shares_with_other_loops(comp_set):
+                        for v in comp_set:
+                            for f in v.link_faces:
+                                if f[grid_layer] > 0 and f[grid_layer] != lid:
+                                    return True
+                        return False
+                    
+                    comp0_shared = component_shares_with_other_loops(comp0_set)
+                    comp1_shared = component_shares_with_other_loops(comp1_set)
+                    
+                    if comp0_shared and not comp1_shared:
+                        inner_verts, outer_verts = comp0, comp1
+                    elif comp1_shared and not comp0_shared:
+                        inner_verts, outer_verts = comp1, comp0
+                    else:
+                        # Fallback: larger component is outer
+                        if len(comp0) >= len(comp1):
+                            outer_verts, inner_verts = comp0, comp1
+                        else:
+                            outer_verts, inner_verts = comp1, comp0
+                    
+                    loops.append({
+                        'type': 'ring',
+                        'loop_id': lid,
+                        'verts': outer_verts,       # outer boundary (drives subdivision)
+                        'inner_verts': inner_verts,  # inner boundary (shared with inner disk)
+                        'faces': F_loop
+                    })
+                    
+
         # 2. Find all unrasterized loops (wire loops) and open paths (line segments)
         wire_edges = [e for e in bm.edges if len(e.link_faces) == 0]
         if wire_edges:
@@ -3801,14 +3956,20 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     if vert_loop_count[v] > 1:
                         splicing_indices.add(idx)
                         
-                self.subdiv_original_loops.append({
+                entry = {
                     'type': loop['type'],
                     'coords': [v.co.copy() for v in loop['verts']],
                     'splicing_indices': splicing_indices,
                     'original_count': len(loop['verts']),
                     'loop_id': loop.get('loop_id', None)
-                })
+                }
+                # For ring loops, also save the inner boundary coords
+                if loop['type'] == 'ring' and 'inner_verts' in loop:
+                    entry['inner_coords'] = [v.co.copy() for v in loop['inner_verts']]
+                    entry['inner_count'] = len(loop['inner_verts'])
+                self.subdiv_original_loops.append(entry)
             self.subdiv_multiplier = 1.0
+
             
         # 2. Update the subdivision multiplier
         prev_multiplier = getattr(self, 'subdiv_multiplier', 1.0)
@@ -3817,8 +3978,11 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 self.subdiv_multiplier += 0.1
             else:
                 # Check if any loop can still be unsubdivided (i.e. has more edges than its minimum limit)
+                # Skip ring loops - their density follows the inner disk loop
                 can_unsubdivide = False
                 for orig_loop in self.subdiv_original_loops:
+                    if orig_loop['type'] == 'ring':
+                        continue
                     orig_count = orig_loop['original_count']
                     splicing_indices = orig_loop.get('splicing_indices', set())
                     is_open = (orig_loop['type'] == 'open_path')
@@ -3857,8 +4021,11 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         bm_backup = bm.copy()
             
         # 3. Calculate new counts and verify if any loop is valid
+        # Skip ring loops — they are rebuilt by bridging inner/outer boundaries later
         loop_updates = []
         for orig_loop in self.subdiv_original_loops:
+            if orig_loop['type'] == 'ring':
+                continue
             orig_count = orig_loop['original_count']
             splicing_indices = orig_loop.get('splicing_indices', set())
             
@@ -3885,6 +4052,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 new_edges = min_allowed_edges
                 
             new_count = (new_edges + 1) if is_open else new_edges
+
                 
             loop_updates.append({
                 'orig_loop': orig_loop,
@@ -4049,11 +4217,88 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     context.area.tag_redraw()
                     return True
             
+        # Collect ring loop data BEFORE deletion (save outer boundary coordinates)
+        ring_loop_data = []
+        for orig_loop in self.subdiv_original_loops:
+            if orig_loop['type'] != 'ring':
+                continue
+            # Resample the outer boundary to match the new inner loop vertex count.
+            # The outer boundary drives the outer shape of the ring.
+            outer_coords = orig_loop['coords']  # outer boundary original coords
+            inner_coords = orig_loop.get('inner_coords', [])  # inner boundary original coords
+            loop_id = orig_loop.get('loop_id', None)
+            
+            # Determine the target count for the ring's outer boundary.
+            # Find the corresponding inner disk's new_count from loop_updates
+            # (the inner disk is the rasterized loop whose outer boundary = ring's inner boundary).
+            # As a heuristic, we set outer boundary count = inner boundary new count.
+            # First: find inner disk loop_update that shares this ring's inner boundary.
+            # Fallback: resample outer boundary to have same count as inner boundary's new count.
+            # We'll compute by using the inner boundary original count and current multiplier.
+            inner_orig_count = orig_loop.get('inner_count', len(inner_coords))
+            outer_orig_count = len(outer_coords)
+            
+            # Determine target outer count: same ratio as inner (preserve ring density ratio)
+            inner_new_edges = round(inner_orig_count * self.subdiv_multiplier)
+            inner_new_edges = max(4, inner_new_edges)
+            # Make inner_new_edges even for rasterized compatibility
+            inner_new_edges = round(inner_new_edges / 2) * 2
+            outer_new_count = inner_new_edges  # ring outer boundary matches inner boundary count
+            
+            # Resample outer boundary to outer_new_count points (closed loop)
+            def resample_closed_loop(coords, target_count):
+                if target_count < 3 or not coords:
+                    return list(coords)
+                P = coords
+                N = len(P)
+                dists = [0.0]
+                for i in range(N):
+                    p1 = P[i]
+                    p2 = P[(i + 1) % N]
+                    dists.append(dists[-1] + (p2 - p1).length)
+                total = dists[-1]
+                if total < 1e-8:
+                    return [P[0].copy()] * target_count
+                result = []
+                for j in range(target_count):
+                    td = (j / target_count) * total
+                    idx = 0
+                    while idx < len(dists) - 1 and dists[idx + 1] < td:
+                        idx += 1
+                    d0 = dists[idx]
+                    d1 = dists[idx + 1] if idx + 1 < len(dists) else dists[-1]
+                    seg_len = d1 - d0
+                    if seg_len > 1e-8:
+                        f = (td - d0) / seg_len
+                    else:
+                        f = 0.0
+                    p1 = P[idx % N]
+                    p2 = P[(idx + 1) % N]
+                    result.append(p1 + f * (p2 - p1))
+                return result
+
+            resampled_outer = resample_closed_loop(outer_coords, outer_new_count)
+            
+            ring_loop_data.append({
+                'loop_id': loop_id,
+                'outer_new_count': outer_new_count,
+                'resampled_outer': resampled_outer,
+                'inner_orig_count': inner_orig_count,
+                'inner_new_count': inner_new_edges,
+            })
+
         # 5. Delete all current loops in the BMesh
+        # For ring loops: also delete their faces (their verts get destroyed when inner disk verts are deleted)
         bm.select_history.clear()
         verts_to_delete = set()
         for loop in current_loops:
             if loop['type'] == 'rasterized':
+                for f in loop['faces']:
+                    if f.is_valid:
+                        verts_to_delete.update(f.verts)
+            elif loop['type'] == 'ring':
+                # Delete ring faces by deleting all their unique verts
+                # (inner boundary shared with inner disk will be deleted via inner disk deletion)
                 for f in loop['faces']:
                     if f.is_valid:
                         verts_to_delete.update(f.verts)
@@ -4162,6 +4407,137 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             except Exception as e:
                 print("Error running grid fill during global subdivision:", e)
                 grid_fill_success = False
+
+        # 7.5 Rebuild ring loops (boundary mode extrusion outer rings)
+        # After the inner disk is grid-filled, find the inner disk's outer perimeter
+        # and create new ring faces bridging it to the resampled outer boundary.
+        if ring_loop_data and grid_fill_success:
+            try:
+                bm = bmesh.from_edit_mesh(topo_obj.data)
+                bm.verts.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
+                grid_layer = bm.faces.layers.int.get("tp_is_grid")
+                if not grid_layer:
+                    grid_layer = bm.faces.layers.int.new("tp_is_grid")
+                
+                for rld in ring_loop_data:
+                    ring_lid = rld['loop_id']
+                    inner_new_count = rld['inner_new_count']
+                    resampled_outer = rld['resampled_outer']
+                    outer_new_count = rld['outer_new_count']
+                    
+                    if not ring_lid or not resampled_outer:
+                        continue
+                    
+                    # Find the inner disk loop_id that the ring was adjacent to.
+                    # The inner disk's faces share boundary with the (now-deleted) ring.
+                    # Identify the inner disk's outer boundary (perimeter) verts.
+                    # Strategy: scan all non-ring filled loops and find the boundary component
+                    # whose count is closest to inner_new_count.
+                    
+                    # Scan all filled rasterized loops (any lid != ring_lid and lid > 0)
+                    filled_lids = set()
+                    for f in bm.faces:
+                        lid = f[grid_layer]
+                        if lid > 0 and lid != ring_lid:
+                            filled_lids.add(lid)
+
+                    
+                    best_inner_verts = []
+                    for disk_lid in sorted(filled_lids):
+                        F_disk = [f for f in bm.faces if f[grid_layer] == disk_lid]
+                        if not F_disk:
+                            continue
+                        E_disk_all = set()
+                        for f in F_disk:
+                            E_disk_all.update(f.edges)
+                        E_disk_boundary = {e for e in E_disk_all if len([f for f in e.link_faces if f[grid_layer] == disk_lid]) == 1}
+                        components = self.trace_all_boundary_components(E_disk_boundary)
+                        if components:
+                            # Use the component with count closest to inner_new_count
+                            for comp in components:
+                                if abs(len(comp) - inner_new_count) < abs(len(best_inner_verts) - inner_new_count):
+                                    best_inner_verts = comp
+                    
+                    if not best_inner_verts or not resampled_outer:
+                        continue
+                    
+                    inner_ring_verts = best_inner_verts
+                    n_inner = len(inner_ring_verts)
+                    n_outer = len(resampled_outer)
+                    
+                    # Resample resampled_outer to match n_inner if needed
+                    if n_outer != n_inner:
+                        resampled_outer = resample_closed_loop(resampled_outer, n_inner)
+                        n_outer = n_inner
+                    
+                    # Create outer boundary verts
+                    outer_new_verts = []
+                    for co in resampled_outer:
+                        v = bm.verts.new(co)
+                        outer_new_verts.append(v)
+                    bm.verts.ensure_lookup_table()
+                    
+                    # Create edges for outer boundary
+                    for i in range(n_outer):
+                        v1 = outer_new_verts[i]
+                        v2 = outer_new_verts[(i + 1) % n_outer]
+                        try:
+                            bm.edges.new((v1, v2))
+                        except Exception:
+                            pass
+                    bm.edges.ensure_lookup_table()
+                    
+                    # Find the alignment offset between inner_ring_verts and outer_new_verts
+                    # by minimizing the total distance between corresponding verts.
+                    min_total_dist = float('inf')
+                    best_offset = 0
+                    for offset in range(n_inner):
+                        total_dist = sum(
+                            (inner_ring_verts[(j + offset) % n_inner].co - outer_new_verts[j].co).length
+                            for j in range(n_inner)
+                        )
+                        if total_dist < min_total_dist:
+                            min_total_dist = total_dist
+                            best_offset = offset
+                    
+                    # Create quad faces bridging inner boundary to outer boundary
+                    new_ring_faces = []
+                    for i in range(n_inner):
+                        v_inner_a = inner_ring_verts[(i + best_offset) % n_inner]
+                        v_inner_b = inner_ring_verts[(i + 1 + best_offset) % n_inner]
+                        v_outer_a = outer_new_verts[i]
+                        v_outer_b = outer_new_verts[(i + 1) % n_outer]
+                        try:
+                            # Validate all 4 verts are distinct and valid
+                            if len({v_inner_a, v_inner_b, v_outer_a, v_outer_b}) == 4:
+                                # Check if face already exists
+                                existing = [f for f in v_inner_a.link_faces if set(f.verts) == {v_inner_a, v_inner_b, v_outer_a, v_outer_b}]
+                                if not existing:
+                                    new_f = bm.faces.new((v_inner_a, v_outer_a, v_outer_b, v_inner_b))
+                                    new_ring_faces.append(new_f)
+                        except Exception as fe:
+                            print(f"Ring face creation error at index {i}: {fe}")
+                    
+                    bm.faces.ensure_lookup_table()
+                    
+                    # Assign the ring loop_id to all new ring faces
+                    for nf in new_ring_faces:
+                        if nf.is_valid:
+                            nf[grid_layer] = ring_lid
+                    
+                    # Weld the outer boundary to any existing geometry
+                    try:
+                        bmesh.ops.remove_doubles(bm, verts=list(set(outer_new_verts + inner_ring_verts)), dist=0.001)
+                    except Exception:
+                        pass
+                
+                bmesh.update_edit_mesh(topo_obj.data)
+                self.rebuild_kd_tree()
+            except Exception as e:
+                print("Error rebuilding ring loops during subdivision:", e)
+
         # Restore the previously active object
         if prev_active is not None:
             try:
@@ -4214,6 +4590,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             
         bmesh.update_edit_mesh(topo_obj.data)
         self.rebuild_kd_tree()
+
         
         # Push undo AFTER grid fill and remove_doubles so that Ctrl+Z restores
         # the fully-filled state (not the intermediate wire-loop state).
@@ -4421,6 +4798,15 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 is_confirm = True
                 
         if is_confirm:
+            import os
+            debug_path = r"C:\Users\12801\.gemini\antigravity\brain\d401ec69-7e15-445d-83b5-48930a3c0a10\scratch\debug_weld.txt"
+            os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+            with open(debug_path, "a", encoding="utf-8") as debug_file:
+                debug_file.write(f"\n--- Grab Confirm ---\n")
+                debug_file.write(f"is_dragging_grab: {getattr(self, 'is_dragging_grab', False)}\n")
+                debug_file.write(f"grab_active_vert_idx: {self.grab_active_vert_idx}\n")
+                debug_file.write(f"grab_snap_target_idx: {self.grab_snap_target_idx}\n")
+            
             bm = bmesh.from_edit_mesh(topo_obj.data)
             bm.verts.ensure_lookup_table()
             bm.verts.index_update()
@@ -4431,15 +4817,31 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     active_v = bm.verts[self.grab_active_vert_idx]
                     target_v = bm.verts[self.grab_snap_target_idx]
                     
+                    with open(debug_path, "a", encoding="utf-8") as debug_file:
+                        debug_file.write(f"active_v.is_valid: {active_v.is_valid}, target_v.is_valid: {target_v.is_valid}\n")
+                        debug_file.write(f"active_v != target_v: {active_v != target_v}\n")
+                    
                     if active_v.is_valid and target_v.is_valid and active_v != target_v:
                         pin_layer = bm.verts.layers.int.get("tp_is_pinned")
-                        is_active_pinned = pin_layer and (active_v[pin_layer] == 1)
-                        if not is_active_pinned:
-                            active_v.co = target_v.co.copy()
-                            try:
-                                bmesh.ops.weld_verts(bm, targetmap={active_v: target_v})
-                            except Exception as e:
-                                print("Weld verts error:", e)
+                        co_layer = bm.verts.layers.float_vector.get("tp_pinned_co")
+                        is_pinned = False
+                        if pin_layer:
+                            if active_v[pin_layer] == 1 or target_v[pin_layer] == 1:
+                                is_pinned = True
+                        
+                        active_v.co = target_v.co.copy()
+                        try:
+                            bmesh.ops.weld_verts(bm, targetmap={active_v: target_v})
+                            with open(debug_path, "a", encoding="utf-8") as debug_file:
+                                debug_file.write("Weld verts operator completed successfully\n")
+                            if is_pinned and pin_layer:
+                                target_v[pin_layer] = 1
+                                if co_layer:
+                                    target_v[co_layer] = target_v.co.copy()
+                        except Exception as e:
+                            with open(debug_path, "a", encoding="utf-8") as debug_file:
+                                debug_file.write(f"Weld verts error: {str(e)}\n")
+                            print("Weld verts error:", e)
                         
             try:
                 if context.scene.tp_boundary_mode:
@@ -4548,6 +4950,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             pin_boundary = context.scene.tp_pin_boundary
             pin_layer = bm.verts.layers.int.get("tp_is_pinned")
             
+            topo_world = topo_obj.matrix_world
             for v_idx, init_co in self.grab_initial_cos.items():
                 if v_idx < len(bm.verts):
                     v = bm.verts[v_idx]
@@ -4556,9 +4959,14 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                         v.co = init_co
                     else:
                         weight = getattr(self, 'grab_weights', {}).get(v_idx, 1.0)
-                        v.co = init_co + delta_local * weight
+                        proposed_local = init_co + delta_local * weight
+                        proposed_world = topo_world @ proposed_local
+                        if is_point_in_mask(proposed_world, context):
+                            clamped_world = clamp_to_mask_boundary(proposed_world, context)
+                            v.co = inv_topo_matrix @ clamped_world
+                        else:
+                            v.co = proposed_local
             
-            topo_world = topo_obj.matrix_world
             ref_matrix = ref_obj.matrix_world
             ref_inverse = ref_matrix.inverted()
             
@@ -4575,7 +4983,12 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
                             if success:
                                 local_pt = location + normal * 0.0005
-                                v.co = inv_topo_matrix @ (ref_matrix @ local_pt)
+                                proj_world = ref_matrix @ local_pt
+                                if is_point_in_mask(proj_world, context):
+                                    clamped_world = clamp_to_mask_boundary(proj_world, context)
+                                    v.co = inv_topo_matrix @ clamped_world
+                                else:
+                                    v.co = inv_topo_matrix @ proj_world
                         except Exception:
                             pass
             
@@ -4599,23 +5012,29 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                 except Exception:
                     candidate_world = world_co
                     
-                if context.scene.tp_boundary_mode:
-                    if not hasattr(self, 'last_valid_active_world'):
-                        self.last_valid_active_world = (topo_world @ active_start_local).copy()
-                        
-                    if self.is_point_occluded(context, ref_obj, candidate_world, region, rv3d):
-                        active_projected_world = self.last_valid_active_world
+                if not hasattr(self, 'last_valid_active_world'):
+                    self.last_valid_active_world = (topo_world @ active_start_local).copy()
+
+                if is_point_in_mask(candidate_world, context):
+                    clamped_world = clamp_to_mask_boundary(candidate_world, context)
+                    active_projected_world = clamped_world
+                    self.last_valid_active_world = clamped_world.copy()
+                else:
+                    if context.scene.tp_boundary_mode:
+                        if self.is_point_occluded(context, ref_obj, candidate_world, region, rv3d):
+                            active_projected_world = self.last_valid_active_world
+                        else:
+                            active_projected_world = candidate_world
+                            self.last_valid_active_world = candidate_world.copy()
                     else:
                         active_projected_world = candidate_world
                         self.last_valid_active_world = candidate_world.copy()
-                else:
-                    active_projected_world = candidate_world
                     
                 active_v.co = inv_topo_matrix @ active_projected_world
             
-            if self.kd_tree and not is_active_pinned:
+            if self.kd_tree:
                 try:
-                    nearest = self.kd_tree.find_n(active_projected_world, 50)
+                    nearest = self.kd_tree.find_n(candidate_world, 50)
                 except Exception:
                     nearest = None
                     
@@ -4652,7 +5071,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                                 snap_candidate_co = target_co_world
                                 
                     if snap_candidate_idx is not None:
-                        crosses = self.check_line_crosses_ref_mesh(ref_obj, snap_candidate_co, active_projected_world)
+                        crosses = self.check_line_crosses_ref_mesh(ref_obj, snap_candidate_co, candidate_world)
                         if not crosses:
                             self.grab_snap_target_idx = snap_candidate_idx
                             self.hover_snap_pt = snap_candidate_co
@@ -5276,20 +5695,28 @@ def on_edge_length_update(self, context):
                                 for idx, v in enumerate(loop['verts']):
                                     if vert_loop_count[v] > 1:
                                         splicing_indices.add(idx)
-                                        
-                                active_op.subdiv_original_loops.append({
+                                
+                                entry = {
                                     'type': loop['type'],
                                     'coords': [v.co.copy() for v in loop['verts']],
                                     'splicing_indices': splicing_indices,
                                     'original_count': len(loop['verts']),
                                     'loop_id': loop.get('loop_id', None)
-                                })
+                                }
+                                # For ring loops, also save the inner boundary coords
+                                if loop['type'] == 'ring' and 'inner_verts' in loop:
+                                    entry['inner_coords'] = [v.co.copy() for v in loop['inner_verts']]
+                                    entry['inner_count'] = len(loop['inner_verts'])
+                                active_op.subdiv_original_loops.append(entry)
                     
                     # Calculate multiplier from target_edge_length
+                    # Ring loops are excluded from this calculation (their density follows inner disk)
                     if getattr(active_op, 'subdiv_original_loops', None):
                         total_len = 0.0
                         total_edges = 0
                         for orig_loop in active_op.subdiv_original_loops:
+                            if orig_loop['type'] == 'ring':
+                                continue  # ring loops follow the inner disk density
                             P = orig_loop['coords']
                             is_open = (orig_loop['type'] == 'open_path')
                             orig_count = orig_loop['original_count']
@@ -5318,6 +5745,7 @@ def on_edge_length_update(self, context):
         _in_edge_length_update = False
 
 
+
 def on_boundary_mode_update(self, context):
     """
     当 tp_boundary_mode 开启时，默认进入编辑模式下的边模式。
@@ -5335,5 +5763,130 @@ def on_boundary_mode_update(self, context):
                 context.scene.tool_settings.mesh_select_mode = (True, False, False)
         except Exception as e:
             print("Error in on_boundary_mode_update:", e)
+class OBJECT_OT_tp_apply_symmetry(bpy.types.Operator):
+    bl_idname = "object.tp_apply_symmetry"
+    bl_label = "确认对称"
+    bl_description = "应用镜像内容并同时退出对称状态"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+        return topo_obj is not None and getattr(context.scene, "tp_symmetry_mode", False)
+
+    def execute(self, context):
+        topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+        if not topo_obj:
+            self.report({'WARNING'}, "未找到拓扑网格对象")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        mod_name = "TP_Mirror"
+        mod = topo_obj.modifiers.get(mod_name)
+
+        if mod:
+            orig_mode = topo_obj.mode
+            orig_active = context.view_layer.objects.active
+            
+            context.view_layer.objects.active = topo_obj
+            if orig_mode != 'OBJECT':
+                try:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                except Exception as e:
+                    self.report({'ERROR'}, f"切换至物体模式失败: {e}")
+                    context.view_layer.objects.active = orig_active
+                    return {'CANCELLED'}
+
+            try:
+                bpy.ops.object.modifier_apply(modifier=mod_name)
+            except Exception as e:
+                self.report({'ERROR'}, f"应用镜像失败: {e}")
+                if orig_mode != 'OBJECT':
+                    try:
+                        bpy.ops.object.mode_set(mode=orig_mode)
+                    except Exception:
+                        pass
+                context.view_layer.objects.active = orig_active
+                return {'CANCELLED'}
+
+            if orig_mode != 'OBJECT':
+                try:
+                    bpy.ops.object.mode_set(mode=orig_mode)
+                except Exception:
+                    pass
+            context.view_layer.objects.active = orig_active
+            self.report({'INFO'}, "已应用镜像内容")
+        else:
+            self.report({'INFO'}, "未检测到活动的镜像修改器")
+
+        # Exit symmetry state
+        scene.tp_symmetry_mode = False
+
+        # Rebuild KDTree in active drawing operator
+        global _active_draw_operator
+        if _active_draw_operator:
+            try:
+                _active_draw_operator.rebuild_kd_tree()
+            except Exception as e:
+                print("Error rebuilding KD-Tree after applying symmetry:", e)
+
+        if context.area:
+            context.area.tag_redraw()
+
+        return {'FINISHED'}
+
+
+def update_mirror_modifier(context):
+    topo_obj = bpy.data.objects.get("TP_Topology_Mesh")
+    if not topo_obj:
+        return
+        
+    scene = context.scene
+    mod_name = "TP_Mirror"
+    
+    if scene.tp_symmetry_mode:
+        mod = topo_obj.modifiers.get(mod_name)
+        if not mod:
+            mod = topo_obj.modifiers.new(name=mod_name, type='MIRROR')
+            
+        if len(topo_obj.modifiers) > 1 and topo_obj.modifiers[0].name != mod_name:
+            try:
+                act_obj = context.view_layer.objects.active
+                context.view_layer.objects.active = topo_obj
+                bpy.ops.object.modifier_move_to_index(modifier=mod_name, index=0)
+                context.view_layer.objects.active = act_obj
+            except Exception as e:
+                print("Error moving mirror modifier:", e)
+                
+        mod.use_axis[0] = scene.tp_symmetry_x
+        mod.use_axis[1] = scene.tp_symmetry_y
+        mod.use_axis[2] = scene.tp_symmetry_z
+        
+        ref_obj_name = context.window_manager.tp_ref_object_name
+        ref_obj = bpy.data.objects.get(ref_obj_name)
+        if ref_obj:
+            mod.mirror_object = ref_obj
+            
+        mod.use_mirror_merge = True
+        mod.merge_threshold = 0.001
+        mod.show_in_editmode = True
+        mod.show_on_cage = True
+    else:
+        mod = topo_obj.modifiers.get(mod_name)
+        if mod:
+            try:
+                topo_obj.modifiers.remove(mod)
+            except Exception as e:
+                print("Error removing mirror modifier:", e)
+
+def on_symmetry_mode_update(self, context):
+    update_mirror_modifier(context)
+    if context.area:
+        context.area.tag_redraw()
+
+def on_symmetry_axis_update(self, context):
+    update_mirror_modifier(context)
+    if context.area:
+        context.area.tag_redraw()
 
 

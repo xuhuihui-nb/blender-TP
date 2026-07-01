@@ -30,6 +30,7 @@ from . import ui
 
 classes = (
     op_draw.OBJECT_OT_tp_topology_draw,
+    op_draw.OBJECT_OT_tp_apply_symmetry,
     op_grid_fill.OBJECT_OT_tp_topology_grid_fill,
     op_grid_fill.OBJECT_OT_tp_topology_remove_grid,
     ui.OBJECT_OT_tp_topology_auto_outline,
@@ -104,6 +105,30 @@ def register():
         default=False,
         update=op_draw.on_seam_edge_update
     )
+    bpy.types.Scene.tp_symmetry_mode = bpy.props.BoolProperty(
+        name="对称",
+        description="启用对称显示拓扑内容",
+        default=True,
+        update=op_draw.on_symmetry_mode_update
+    )
+    bpy.types.Scene.tp_symmetry_x = bpy.props.BoolProperty(
+        name="X",
+        description="X轴对称",
+        default=True,
+        update=op_draw.on_symmetry_axis_update
+    )
+    bpy.types.Scene.tp_symmetry_y = bpy.props.BoolProperty(
+        name="Y",
+        description="Y轴对称",
+        default=False,
+        update=op_draw.on_symmetry_axis_update
+    )
+    bpy.types.Scene.tp_symmetry_z = bpy.props.BoolProperty(
+        name="Z",
+        description="Z轴对称",
+        default=False,
+        update=op_draw.on_symmetry_axis_update
+    )
     bpy.types.Scene.tp_auto_grid_fill = bpy.props.BoolProperty(
         name="自动填充栅格",
         description="是否自动将绘制的闭合圈填充为栅格网格",
@@ -153,6 +178,10 @@ def unregister():
     del bpy.types.Scene.tp_smooth_strength
     del bpy.types.Scene.tp_pin_boundary
     del bpy.types.Scene.tp_seam_edge
+    del bpy.types.Scene.tp_symmetry_mode
+    del bpy.types.Scene.tp_symmetry_x
+    del bpy.types.Scene.tp_symmetry_y
+    del bpy.types.Scene.tp_symmetry_z
     del bpy.types.Scene.tp_auto_grid_fill
     del bpy.types.Scene.tp_grid_span
     del bpy.types.Scene.tp_grid_offset
