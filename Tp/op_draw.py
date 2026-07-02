@@ -575,7 +575,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if (is_square or is_circle) and ctrl_pressed:
             if not getattr(self, '_cursor_hidden', False):
                 try:
-                    context.window.cursor_restore()
+                    context.window.cursor_modal_restore()
                 except Exception:
                     pass
                 try:
@@ -586,7 +586,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         else:
             if getattr(self, '_cursor_hidden', False):
                 try:
-                    context.window.cursor_restore()
+                    context.window.cursor_modal_restore()
                 except Exception:
                     pass
                 try:
@@ -4095,7 +4095,11 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
 
     def cleanup(self, context):
         try:
-            context.window.cursor_restore()
+            context.window.cursor_modal_restore()
+        except Exception:
+            pass
+        try:
+            context.window.cursor_set('DEFAULT')
         except Exception:
             pass
         global _active_draw_operator
