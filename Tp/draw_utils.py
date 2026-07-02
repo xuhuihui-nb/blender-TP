@@ -6,7 +6,9 @@ import math
 import mathutils
 from gpu_extras.batch import batch_for_shader
 from bpy_extras.view3d_utils import (
-    location_3d_to_region_2d
+    location_3d_to_region_2d,
+    region_2d_to_origin_3d,
+    region_2d_to_vector_3d
 )
 
 def get_shader():
@@ -62,6 +64,67 @@ def get_polyline_info():
                     _polyline_shader = None
                     _is_polyline = False
     return _polyline_shader, _is_polyline
+
+def group_coords_into_strips(edges):
+    if not edges:
+        return []
+    chains = []
+    for p1, p2 in edges:
+        p1_val = p1
+        p2_val = p2
+        found_merge = False
+        for chain in chains:
+            if (chain[0] - p1_val).length < 1e-4:
+                chain.insert(0, p2_val)
+                found_merge = True
+                break
+            elif (chain[0] - p2_val).length < 1e-4:
+                chain.insert(0, p1_val)
+                found_merge = True
+                break
+            elif (chain[-1] - p1_val).length < 1e-4:
+                chain.append(p2_val)
+                found_merge = True
+                break
+            elif (chain[-1] - p2_val).length < 1e-4:
+                chain.append(p1_val)
+                found_merge = True
+                break
+        if not found_merge:
+            chains.append([p1_val, p2_val])
+            
+    merged = True
+    while merged:
+        merged = False
+        new_chains = []
+        while chains:
+            c1 = chains.pop(0)
+            connected = False
+            for i, c2 in enumerate(new_chains):
+                if (c1[-1] - c2[0]).length < 1e-4:
+                    new_chains[i] = c1 + c2[1:]
+                    connected = True
+                    merged = True
+                    break
+                elif (c1[0] - c2[-1]).length < 1e-4:
+                    new_chains[i] = c2 + c1[1:]
+                    connected = True
+                    merged = True
+                    break
+                elif (c1[0] - c2[0]).length < 1e-4:
+                    new_chains[i] = list(reversed(c1)) + c2[1:]
+                    connected = True
+                    merged = True
+                    break
+                elif (c1[-1] - c2[-1]).length < 1e-4:
+                    new_chains[i] = c2 + list(reversed(c1))[1:]
+                    connected = True
+                    merged = True
+                    break
+            if not connected:
+                new_chains.append(c1)
+        chains = new_chains
+    return chains
 
 def draw_lines_smooth(coords, color, width, shader, is_polyline=False, draw_type='LINES'):
     if not coords or shader is None:
@@ -164,6 +227,22 @@ def get_seam_target_edges_local(bm):
         if e.is_boundary:
             target_edges.add(e)
             
+    try:
+        with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+            f_log.write(f"\n--- get_seam_target_edges_local ---\n")
+            f_log.write(f"bm.edges count: {len(bm.edges)}\n")
+            f_log.write(f"target_edges count: {len(target_edges)}\n")
+            grid_layer = bm.faces.layers.int.get("tp_is_grid")
+            for e in target_edges:
+                f_lids = [f[grid_layer] if grid_layer else 0 for f in e.link_faces]
+                f_verts = [[v.index for v in f.verts] for f in e.link_faces]
+                f_indexes = [f.index for f in e.link_faces]
+                f_details = [f"f_idx={f_idx}(lid={lid}, verts={verts})" for f_idx, lid, verts in zip(f_indexes, f_lids, f_verts)]
+                f_details_str = ", ".join(f_details)
+                f_log.write(f"  Edge ({e.verts[0].index}, {e.verts[1].index}) - is_boundary={e.is_boundary}, link_faces=[{f_details_str}]\n")
+    except Exception as e:
+        print("Error logging target edges:", e)
+
     return target_edges
 
 def get_mirrored_coords(co, context, topo_obj):
@@ -427,10 +506,10 @@ def draw_symmetry_masks(self, context):
     min_local = mathutils.Vector((min(v.x for v in bbox), min(v.y for v in bbox), min(v.z for v in bbox)))
     max_local = mathutils.Vector((max(v.x for v in bbox), max(v.y for v in bbox), max(v.z for v in bbox)))
     
-    # Scale outward by 10% relative to the origin (keeps symmetry planes anchored at 0.0)
-    x_min, x_max = min_local.x * 1.1, max_local.x * 1.1
-    y_min, y_max = min_local.y * 1.1, max_local.y * 1.1
-    z_min, z_max = min_local.z * 1.1, max_local.z * 1.1
+    # Scale outward by 3% relative to the origin (keeps symmetry planes anchored at 0.0)
+    x_min, x_max = min_local.x * 1.03, max_local.x * 1.03
+    y_min, y_max = min_local.y * 1.03, max_local.y * 1.03
+    z_min, z_max = min_local.z * 1.03, max_local.z * 1.03
     
     shader_3d = get_shader()
     if not shader_3d:
@@ -444,8 +523,8 @@ def draw_symmetry_masks(self, context):
     except Exception:
         pass
         
-    face_color = (0.0, 0.4, 1.0, 0.15)
-    line_color = (0.0, 0.5, 1.0, 0.4)
+    face_color = (0.0, 0.0, 0.0, 0.25)
+    line_color = (0.0, 0.0, 0.0, 0.0)
     
     matrix_world = ref_obj.matrix_world
     
@@ -483,7 +562,7 @@ def draw_symmetry_masks(self, context):
     for xr_min, xr_max, yr_min, yr_max, zr_min, zr_max, faces_list in boxes_ranges:
         for f in faces_list:
             add_custom_quad(xr_min, xr_max, yr_min, yr_max, zr_min, zr_max, f, matrix_world, combined_faces, combined_edges)
-                
+                 
     # Remove duplicate wireframe lines to keep them perfectly clean
     unique_edges = []
     seen = set()
@@ -496,7 +575,7 @@ def draw_symmetry_masks(self, context):
         if key not in seen:
             seen.add(key)
             unique_edges.extend((p1, p2))
-            
+             
     if combined_faces:
         shader_3d.bind()
         shader_3d.uniform_float("color", face_color)
@@ -506,15 +585,16 @@ def draw_symmetry_masks(self, context):
         except Exception:
             pass
             
-    if unique_edges:
-        shader_3d.bind()
-        shader_3d.uniform_float("color", line_color)
-        try:
-            gpu.state.line_width_set(1.5)
-            batch = batch_for_shader(shader_3d, 'LINES', {"pos": unique_edges})
-            batch.draw(shader_3d)
-        except Exception:
-            pass
+    # Do not draw wireframe lines (the blue cover outlines)
+    # if unique_edges:
+    #     shader_3d.bind()
+    #     #     shader_3d.uniform_float("color", line_color)
+    #     #     try:
+    #     #         gpu.state.line_width_set(1.5)
+    #     #         batch = batch_for_shader(shader_3d, 'LINES', {"pos": unique_edges})
+    #     #         batch.draw(shader_3d)
+    #     #     except Exception:
+    #     #         pass
             
     try:
         gpu.state.blend_set('NONE')
@@ -802,19 +882,17 @@ def draw_callback(self, context):
 
                 # 1. Draw unaffected boundary edges (white)
                 if unselected_edges:
-                    coords = []
-                    for p1, p2 in unselected_edges:
-                        coords.append(tuple(offset_towards_camera(p1, context)))
-                        coords.append(tuple(offset_towards_camera(p2, context)))
-                    draw_lines_smooth(coords, (1.0, 1.0, 1.0, 1.0), 4.0, poly_shader, is_poly, 'LINES')
+                    strips = group_coords_into_strips(unselected_edges)
+                    for strip in strips:
+                        coords = [tuple(offset_towards_camera(p, context)) for p in strip]
+                        draw_lines_smooth(coords, (1.0, 1.0, 1.0, 1.0), 4.0, poly_shader, is_poly, 'LINE_STRIP')
 
                 # 2. Draw selected boundary edges (orange, fully opaque)
                 if selected_edges:
-                    coords = []
-                    for p1, p2 in selected_edges:
-                        coords.append(tuple(offset_towards_camera(p1, context)))
-                        coords.append(tuple(offset_towards_camera(p2, context)))
-                    draw_lines_smooth(coords, (1.0, 0.6, 0.0, 1.0), 4.0, poly_shader, is_poly, 'LINES')
+                    strips = group_coords_into_strips(selected_edges)
+                    for strip in strips:
+                        coords = [tuple(offset_towards_camera(p, context)) for p in strip]
+                        draw_lines_smooth(coords, (1.0, 0.6, 0.0, 1.0), 4.0, poly_shader, is_poly, 'LINE_STRIP')
 
                 # 3. During grab: draw influence-weighted orange edges
                 if influenced_edges:
@@ -824,11 +902,10 @@ def draw_callback(self, context):
                         bucket = round(w * 16) / 16
                         buckets[bucket].append((p1, p2))
                     for alpha, pairs in buckets.items():
-                        coords = []
-                        for p1, p2 in pairs:
-                            coords.append(tuple(offset_towards_camera(p1, context)))
-                            coords.append(tuple(offset_towards_camera(p2, context)))
-                        draw_lines_smooth(coords, (1.0, 0.6, 0.0, alpha), 4.0, poly_shader, is_poly, 'LINES')
+                        strips = group_coords_into_strips(pairs)
+                        for strip in strips:
+                            coords = [tuple(offset_towards_camera(p, context)) for p in strip]
+                            draw_lines_smooth(coords, (1.0, 0.6, 0.0, alpha), 4.0, poly_shader, is_poly, 'LINE_STRIP')
 
                 # Restore original depth test state
                 try:
@@ -895,11 +972,10 @@ def draw_callback(self, context):
 
                 # 1. Always draw edges (lines) if they exist
                 if pinned_edges:
-                    coords = []
-                    for p1, p2 in pinned_edges:
-                        coords.append(tuple(offset_towards_camera(p1, context)))
-                        coords.append(tuple(offset_towards_camera(p2, context)))
-                    draw_lines_smooth(coords, (1.0, 0.9, 0.0, 1.0), 4.0, poly_shader, is_poly, 'LINES')
+                    strips = group_coords_into_strips(pinned_edges)
+                    for strip in strips:
+                        coords = [tuple(offset_towards_camera(p, context)) for p in strip]
+                        draw_lines_smooth(coords, (1.0, 0.9, 0.0, 1.0), 4.0, poly_shader, is_poly, 'LINE_STRIP')
 
                 # Restore original depth test state
                 try:
@@ -1002,6 +1078,327 @@ def draw_text_callback(self, context):
                 theta = 2.0 * math.pi * i / num_segments
                 circle_coords.append((cx + radius * math.cos(theta), cy + radius * math.sin(theta), 0.0))
             draw_lines_smooth(circle_coords, (1.0, 1.0, 1.0, 1.0), 4.0, poly_shader, is_poly, 'LINE_STRIP')
+
+    # 0.2. Draw green square cursor for square topology mode
+    if getattr(context.scene, "tp_square_mode", False) and getattr(self, 'last_ctrl_state', False):
+        poly_shader, is_poly = get_polyline_info()
+        shader2d = get_shader_2d()
+        if poly_shader:
+            world_pt, world_normal = None, None
+            ref_obj_name = getattr(self, 'ref_object_name', '')
+            if not ref_obj_name:
+                ref_obj_name = context.window_manager.tp_ref_object_name
+            ref_obj = bpy.data.objects.get(ref_obj_name)
+            if ref_obj:
+                region = context.region
+                rv3d = context.space_data.region_3d
+                ray_origin = region_2d_to_origin_3d(region, rv3d, self.last_mouse_coord)
+                ray_vector = region_2d_to_vector_3d(region, rv3d, self.last_mouse_coord)
+                matrix_world = ref_obj.matrix_world
+                matrix_inverse = matrix_world.inverted()
+                ray_origin_local = matrix_inverse @ ray_origin
+                ray_vector_local = matrix_inverse.to_3x3() @ ray_vector
+                depsgraph = context.evaluated_depsgraph_get()
+                try:
+                    success, location, normal, face_idx = ref_obj.ray_cast(
+                        ray_origin_local,
+                        ray_vector_local,
+                        depsgraph=depsgraph
+                    )
+                except Exception:
+                    try:
+                        success, location, normal, face_idx = ref_obj.ray_cast(
+                            ray_origin_local,
+                            ray_vector_local
+                        )
+                    except Exception:
+                        success = False
+                if success:
+                    local_pt = location + normal * 0.0005
+                    world_pt = matrix_world @ local_pt
+                    world_normal = (matrix_world.to_3x3() @ normal).normalized()
+            
+            s = {}
+            square_count = getattr(context.scene, "tp_square_count", '1')
+            if square_count == '4':
+                N = 2
+            elif square_count == '16':
+                N = 4
+            elif square_count == '64':
+                N = 8
+            else:
+                N = 1
+
+            if world_pt and world_normal:
+                rv3d = context.space_data.region_3d
+                inv_view = rv3d.view_matrix.inverted()
+                camera_right = inv_view.to_3x3() @ mathutils.Vector((1, 0, 0))
+                
+                right = (camera_right - camera_right.dot(world_normal) * world_normal).normalized()
+                up = world_normal.cross(right).normalized()
+                
+                d = context.scene.tp_edge_length
+                
+                region = context.region
+                for i in range(N + 1):
+                    for j in range(N + 1):
+                        offset_right = (i - N / 2.0) * d
+                        offset_up = (j - N / 2.0) * d
+                        p_world = world_pt + offset_right * right + offset_up * up
+                        s[(i, j)] = location_3d_to_region_2d(region, rv3d, p_world)
+            else:
+                cx, cy = self.last_mouse_coord[0], self.last_mouse_coord[1]
+                total_size = 40.0
+                cell_size = total_size / N
+                for i in range(N + 1):
+                    for j in range(N + 1):
+                        x = cx + (i - N / 2.0) * cell_size
+                        y = cy + (j - N / 2.0) * cell_size
+                        s[(i, j)] = (x, y)
+            
+            # Draw the grid
+            coords_fill = []
+            for i in range(N):
+                for j in range(N):
+                    sc1 = s.get((i, j))
+                    sc2 = s.get((i + 1, j))
+                    sc3 = s.get((i + 1, j + 1))
+                    sc4 = s.get((i, j + 1))
+                    if sc1 and sc2 and sc3 and sc4:
+                        coords_fill.extend([
+                            (sc1[0], sc1[1]),
+                            (sc2[0], sc2[1]),
+                            (sc3[0], sc3[1]),
+                            (sc1[0], sc1[1]),
+                            (sc3[0], sc3[1]),
+                            (sc4[0], sc4[1]),
+                        ])
+            if coords_fill and shader2d:
+                shader2d.bind()
+                shader2d.uniform_float("color", (0.22, 0.70, 0.52, 0.7))
+                try:
+                    batch_fill = batch_for_shader(shader2d, 'TRIS', {"pos": coords_fill})
+                    batch_fill.draw(shader2d)
+                except Exception:
+                    pass
+            
+            # Draw outline
+            outline_coords = []
+            for i in range(N + 1):
+                pt = s.get((i, 0))
+                if pt:
+                    outline_coords.append((pt[0], pt[1], 0.0))
+            for j in range(1, N + 1):
+                pt = s.get((N, j))
+                if pt:
+                    outline_coords.append((pt[0], pt[1], 0.0))
+            for i in range(N - 1, -1, -1):
+                pt = s.get((i, N))
+                if pt:
+                    outline_coords.append((pt[0], pt[1], 0.0))
+            for j in range(N - 1, -1, -1):
+                pt = s.get((0, j))
+                if pt:
+                    outline_coords.append((pt[0], pt[1], 0.0))
+            
+            if outline_coords:
+                draw_lines_smooth(outline_coords, (1.0, 1.0, 1.0, 1.0), 3.0, poly_shader, is_poly, 'LINE_STRIP')
+            
+            # Draw internal grid lines
+            internal_line_coords = []
+            for i in range(N + 1):
+                for j in range(N):
+                    if 0 < i < N:
+                        p_a = s.get((i, j))
+                        p_b = s.get((i, j + 1))
+                        if p_a and p_b:
+                            internal_line_coords.append((p_a[0], p_a[1], 0.0))
+                            internal_line_coords.append((p_b[0], p_b[1], 0.0))
+            for j in range(N + 1):
+                for i in range(N):
+                    if 0 < j < N:
+                        p_a = s.get((i, j))
+                        p_b = s.get((i + 1, j))
+                        if p_a and p_b:
+                            internal_line_coords.append((p_a[0], p_a[1], 0.0))
+                            internal_line_coords.append((p_b[0], p_b[1], 0.0))
+            
+            if internal_line_coords:
+                draw_lines_smooth(internal_line_coords, (0.05, 0.05, 0.05, 1.0), 2.0, poly_shader, is_poly, 'LINES')
+
+    # 0.3. Draw green octagon cursor for circle topology mode
+    if getattr(context.scene, "tp_circle_mode", False) and getattr(self, 'last_ctrl_state', False):
+        poly_shader, is_poly = get_polyline_info()
+        shader2d = get_shader_2d()
+        if poly_shader:
+            world_pt, world_normal = None, None
+            ref_obj_name = getattr(self, 'ref_object_name', '')
+            if not ref_obj_name:
+                ref_obj_name = context.window_manager.tp_ref_object_name
+            ref_obj = bpy.data.objects.get(ref_obj_name)
+            if ref_obj:
+                region = context.region
+                rv3d = context.space_data.region_3d
+                ray_origin = region_2d_to_origin_3d(region, rv3d, self.last_mouse_coord)
+                ray_vector = region_2d_to_vector_3d(region, rv3d, self.last_mouse_coord)
+                matrix_world = ref_obj.matrix_world
+                matrix_inverse = matrix_world.inverted()
+                ray_origin_local = matrix_inverse @ ray_origin
+                ray_vector_local = matrix_inverse.to_3x3() @ ray_vector
+                depsgraph = context.evaluated_depsgraph_get()
+                try:
+                    success, location, normal, face_idx = ref_obj.ray_cast(
+                        ray_origin_local,
+                        ray_vector_local,
+                        depsgraph=depsgraph
+                    )
+                except Exception:
+                    try:
+                        success, location, normal, face_idx = ref_obj.ray_cast(
+                            ray_origin_local,
+                            ray_vector_local
+                        )
+                    except Exception:
+                        success = False
+                if success:
+                    local_pt = location + normal * 0.0005
+                    world_pt = matrix_world @ local_pt
+                    world_normal = (matrix_world.to_3x3() @ normal).normalized()
+            
+            circle_type = getattr(context.scene, "tp_circle_count", '4')
+            d = context.scene.tp_edge_length
+            s_pts = []
+            s_pts_inner = []
+            c_screen = None
+            if world_pt and world_normal:
+                rv3d = context.space_data.region_3d
+                inv_view = rv3d.view_matrix.inverted()
+                camera_right = inv_view.to_3x3() @ mathutils.Vector((1, 0, 0))
+                
+                right = (camera_right - camera_right.dot(world_normal) * world_normal).normalized()
+                up = world_normal.cross(right).normalized()
+                
+                region = context.region
+                c_screen = location_3d_to_region_2d(region, rv3d, world_pt)
+                for k in range(8):
+                    theta = k * math.pi / 4.0
+                    p_world = world_pt + (d * math.cos(theta)) * right + (d * math.sin(theta)) * up
+                    s_pts.append(location_3d_to_region_2d(region, rv3d, p_world))
+                
+                if circle_type == '8_ring':
+                    d_inner = d * 0.6
+                    for k in range(8):
+                        theta = k * math.pi / 4.0
+                        p_world = world_pt + (d_inner * math.cos(theta)) * right + (d_inner * math.sin(theta)) * up
+                        s_pts_inner.append(location_3d_to_region_2d(region, rv3d, p_world))
+            else:
+                cx, cy = self.last_mouse_coord[0], self.last_mouse_coord[1]
+                c_screen = (cx, cy)
+                R_2d = 40.0
+                for k in range(8):
+                    theta = k * math.pi / 4.0
+                    x = cx + R_2d * math.cos(theta)
+                    y = cy + R_2d * math.sin(theta)
+                    s_pts.append((x, y))
+                
+                if circle_type == '8_ring':
+                    R_inner_2d = R_2d * 0.6
+                    for k in range(8):
+                        theta = k * math.pi / 4.0
+                        x = cx + R_inner_2d * math.cos(theta)
+                        y = cy + R_inner_2d * math.sin(theta)
+                        s_pts_inner.append((x, y))
+            
+            if circle_type == '8_ring':
+                if s_pts and s_pts_inner and all(s_pts) and all(s_pts_inner):
+                    # Draw filled ring quads (as triangles)
+                    coords_fill = []
+                    for k in range(8):
+                        p_o_k = s_pts[k]
+                        p_o_next = s_pts[(k + 1) % 8]
+                        p_i_next = s_pts_inner[(k + 1) % 8]
+                        p_i_k = s_pts_inner[k]
+                        
+                        # First triangle: p_o_k, p_o_next, p_i_next
+                        coords_fill.extend([
+                            (p_o_k[0], p_o_k[1]),
+                            (p_o_next[0], p_o_next[1]),
+                            (p_i_next[0], p_i_next[1]),
+                        ])
+                        # Second triangle: p_o_k, p_i_next, p_i_k
+                        coords_fill.extend([
+                            (p_o_k[0], p_o_k[1]),
+                            (p_i_next[0], p_i_next[1]),
+                            (p_i_k[0], p_i_k[1]),
+                        ])
+                    
+                    if coords_fill and shader2d:
+                        shader2d.bind()
+                        shader2d.uniform_float("color", (0.22, 0.70, 0.52, 0.7))
+                        try:
+                            batch_fill = batch_for_shader(shader2d, 'TRIS', {"pos": coords_fill})
+                            batch_fill.draw(shader2d)
+                        except Exception:
+                            pass
+                    
+                    # Draw outer outline
+                    outline_outer = []
+                    for k in range(9):
+                        pt = s_pts[k % 8]
+                        outline_outer.append((pt[0], pt[1], 0.0))
+                    draw_lines_smooth(outline_outer, (1.0, 1.0, 1.0, 1.0), 3.0, poly_shader, is_poly, 'LINE_STRIP')
+                    
+                    # Draw inner outline
+                    outline_inner = []
+                    for k in range(9):
+                        pt = s_pts_inner[k % 8]
+                        outline_inner.append((pt[0], pt[1], 0.0))
+                    draw_lines_smooth(outline_inner, (1.0, 1.0, 1.0, 1.0), 3.0, poly_shader, is_poly, 'LINE_STRIP')
+                    
+                    # Draw radial division lines
+                    division_coords = []
+                    for k in range(8):
+                        pt_o = s_pts[k]
+                        pt_i = s_pts_inner[k]
+                        division_coords.extend([
+                            (pt_o[0], pt_o[1], 0.0),
+                            (pt_i[0], pt_i[1], 0.0)
+                        ])
+                    draw_lines_smooth(division_coords, (0.05, 0.05, 0.05, 1.0), 2.0, poly_shader, is_poly, 'LINES')
+            else:
+                if c_screen and all(s_pts):
+                    # Draw filled triangles
+                    coords_fill = []
+                    for k in range(8):
+                        coords_fill.extend([
+                            (c_screen[0], c_screen[1]),
+                            (s_pts[k][0], s_pts[k][1]),
+                            (s_pts[(k + 1) % 8][0], s_pts[(k + 1) % 8][1]),
+                        ])
+                    if coords_fill and shader2d:
+                        shader2d.bind()
+                        shader2d.uniform_float("color", (0.22, 0.70, 0.52, 0.7))
+                        try:
+                            batch_fill = batch_for_shader(shader2d, 'TRIS', {"pos": coords_fill})
+                            batch_fill.draw(shader2d)
+                        except Exception:
+                            pass
+                    
+                    # Draw outline
+                    outline_coords = []
+                    for k in range(9):
+                        pt = s_pts[k % 8]
+                        outline_coords.append((pt[0], pt[1], 0.0))
+                    draw_lines_smooth(outline_coords, (1.0, 1.0, 1.0, 1.0), 3.0, poly_shader, is_poly, 'LINE_STRIP')
+                    
+                    # Draw crosshair lines
+                    crosshair_coords = [
+                        (s_pts[4][0], s_pts[4][1], 0.0),
+                        (s_pts[0][0], s_pts[0][1], 0.0),
+                        (s_pts[6][0], s_pts[6][1], 0.0),
+                        (s_pts[2][0], s_pts[2][1], 0.0)
+                    ]
+                    draw_lines_smooth(crosshair_coords, (0.05, 0.05, 0.05, 1.0), 2.0, poly_shader, is_poly, 'LINES')
 
     # 0.5. Draw selected boundary vertices and pinned vertices
     if True:

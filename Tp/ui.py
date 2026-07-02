@@ -1,15 +1,5 @@
 import bpy
 
-class OBJECT_OT_tp_topology_auto_outline(bpy.types.Operator):
-    bl_idname = "object.tp_topology_auto_outline"
-    bl_label = "生成结构线"
-    bl_description = "生成结构线 (暂无功能)"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        self.report({'INFO'}, "生成结构线功能暂未实现")
-        return {'FINISHED'}
-
 class OBJECT_OT_tp_set_fixed_point_count(bpy.types.Operator):
     bl_idname = "object.tp_set_fixed_point_count"
     bl_label = "设置固定点数"
@@ -76,10 +66,8 @@ class VIEW3D_PT_tp_topology(bpy.types.Panel):
             col.separator()
             row_auto = col.row(align=True)
             row_auto.scale_y = 2.0
-            row_auto.operator(
-                "object.tp_topology_auto_outline",
-                text=""
-            )
+            row_auto.prop(scene, "tp_square_mode", text="方形", toggle=True)
+            row_auto.prop(scene, "tp_circle_mode", text="圆形", toggle=True)
             col.separator()
             
             # 栅格微调面板

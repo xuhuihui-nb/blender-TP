@@ -281,6 +281,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         self.is_dragging = False
         self.is_polyline = False
         self.is_outside_drawing = False
+        self._cursor_hidden = False
         self.is_grabbing = False
         self.grab_dragged = False
         self.grab_initial_cos = {}
@@ -367,6 +368,10 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         except Exception:
             pass
             
+        try:
+            context.window.cursor_modal_set('CROSSHAIR')
+        except Exception:
+            pass
         context.window_manager.modal_handler_add(self)
         
         # 备份并替换用户的吸附状态为高模拓扑专用状态
@@ -508,6 +513,46 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             return self.handle_smooth_modal(context, event)
 
         if event.ctrl and event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}:
+            if getattr(context.scene, "tp_square_mode", False):
+                curr_count = getattr(context.scene, "tp_square_count", '1')
+                if event.type == 'WHEELUPMOUSE':
+                    if curr_count == '1':
+                        next_count = '4'
+                    elif curr_count == '4':
+                        next_count = '16'
+                    elif curr_count == '16':
+                        next_count = '64'
+                    else:
+                        next_count = '1'
+                else:  # WHEELDOWNMOUSE
+                    if curr_count == '1':
+                        next_count = '64'
+                    elif curr_count == '64':
+                        next_count = '16'
+                    elif curr_count == '16':
+                        next_count = '4'
+                    else:
+                        next_count = '1'
+                context.scene.tp_square_count = next_count
+                if context.area:
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+            elif getattr(context.scene, "tp_circle_mode", False):
+                curr_count = getattr(context.scene, "tp_circle_count", '4')
+                if event.type == 'WHEELUPMOUSE':
+                    if curr_count == '4':
+                        next_count = '8_ring'
+                    else:
+                        next_count = '4'
+                else:  # WHEELDOWNMOUSE
+                    if curr_count == '4':
+                        next_count = '8_ring'
+                    else:
+                        next_count = '4'
+                context.scene.tp_circle_count = next_count
+                if context.area:
+                    context.area.tag_redraw()
+                return {'RUNNING_MODAL'}
             if self.handle_loop_subdivision(context, event):
                 return {'RUNNING_MODAL'}
 
@@ -518,11 +563,37 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             if topo_obj and topo_obj.mode == 'EDIT':
                 try:
                     bm_weld = bmesh.from_edit_mesh(topo_obj.data)
-                    bmesh.ops.remove_doubles(bm_weld, verts=bm_weld.verts, dist=0.001)
+                    weld_dist = 0.001  # Safe threshold to remove exact duplicates on Ctrl press
+                    bmesh.ops.remove_doubles(bm_weld, verts=bm_weld.verts, dist=weld_dist)
                     bmesh.update_edit_mesh(topo_obj.data)
                 except Exception as e:
                     print("Error welding vertices on Ctrl press:", e)
         self.last_ctrl_state = ctrl_pressed
+
+        is_square = getattr(context.scene, "tp_square_mode", False)
+        is_circle = getattr(context.scene, "tp_circle_mode", False)
+        if (is_square or is_circle) and ctrl_pressed:
+            if not getattr(self, '_cursor_hidden', False):
+                try:
+                    context.window.cursor_restore()
+                except Exception:
+                    pass
+                try:
+                    context.window.cursor_modal_set('NONE')
+                except Exception:
+                    pass
+                self._cursor_hidden = True
+        else:
+            if getattr(self, '_cursor_hidden', False):
+                try:
+                    context.window.cursor_restore()
+                except Exception:
+                    pass
+                try:
+                    context.window.cursor_modal_set('CROSSHAIR')
+                except Exception:
+                    pass
+                self._cursor_hidden = False
 
         if event.type == 'ESC':
             self.cleanup(context)
@@ -866,6 +937,399 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             return {'RUNNING_MODAL'}
                             
             if event.type == 'LEFTMOUSE' and event.value == 'PRESS' and event.ctrl:
+                if getattr(context.scene, "tp_square_mode", False):
+                    coord = (event.mouse_region_x, event.mouse_region_y)
+                    topo_obj = self.ensure_topo_obj_exists(context)
+                    if topo_obj.mode != 'EDIT':
+                        try:
+                            bpy.ops.object.mode_set(mode='EDIT')
+                        except Exception as e:
+                            print("Failed to enter Edit Mode:", e)
+                    if context.view_layer.objects.active != topo_obj:
+                        context.view_layer.objects.active = topo_obj
+                    if not topo_obj.select_get():
+                        topo_obj.select_set(True)
+                    
+                    world_pt, world_normal = None, None
+                    ref_obj_name = getattr(self, 'ref_object_name', '')
+                    if not ref_obj_name:
+                        ref_obj_name = context.window_manager.tp_ref_object_name
+                    ref_obj = bpy.data.objects.get(ref_obj_name)
+                    if ref_obj:
+                        region = context.region
+                        rv3d = context.space_data.region_3d
+                        ray_origin = region_2d_to_origin_3d(region, rv3d, coord)
+                        ray_vector = region_2d_to_vector_3d(region, rv3d, coord)
+                        matrix_world = ref_obj.matrix_world
+                        matrix_inverse = matrix_world.inverted()
+                        ray_origin_local = matrix_inverse @ ray_origin
+                        ray_vector_local = matrix_inverse.to_3x3() @ ray_vector
+                        depsgraph = context.evaluated_depsgraph_get()
+                        try:
+                            success, location, normal, face_idx = ref_obj.ray_cast(
+                                ray_origin_local,
+                                ray_vector_local,
+                                depsgraph=depsgraph
+                            )
+                        except Exception:
+                            try:
+                                success, location, normal, face_idx = ref_obj.ray_cast(
+                                    ray_origin_local,
+                                    ray_vector_local
+                                )
+                            except Exception:
+                                success = False
+                        if success:
+                            local_pt = location + normal * 0.0005
+                            world_pt = matrix_world @ local_pt
+                            world_normal = (matrix_world.to_3x3() @ normal).normalized()
+                    
+                    if world_pt and world_normal:
+                        if is_point_in_mask(world_pt, context):
+                            self.report({'WARNING'}, "无法在对称遮罩区内绘制")
+                            return {'RUNNING_MODAL'}
+                            
+                        rv3d = context.space_data.region_3d
+                        inv_view = rv3d.view_matrix.inverted()
+                        camera_right = inv_view.to_3x3() @ mathutils.Vector((1, 0, 0))
+                        
+                        right = (camera_right - camera_right.dot(world_normal) * world_normal).normalized()
+                        up = world_normal.cross(right).normalized()
+                        
+                        d = context.scene.tp_edge_length
+                        
+                        # Determine grid size N
+                        square_count = getattr(context.scene, "tp_square_count", '1')
+                        if square_count == '4':
+                            N = 2
+                        elif square_count == '16':
+                            N = 4
+                        elif square_count == '64':
+                            N = 8
+                        else:
+                            N = 1
+                        
+                        ref_matrix_world = ref_obj.matrix_world
+                        ref_matrix_inverse = ref_matrix_world.inverted()
+                        
+                        bm = bmesh.from_edit_mesh(topo_obj.data)
+                        bm.verts.ensure_lookup_table()
+                        
+                        weld_threshold = d * 0.75
+                        topo_inv = topo_obj.matrix_world.inverted()
+                        
+                        grid_verts = {}
+                        for i in range(N + 1):
+                            for j in range(N + 1):
+                                offset_right = (i - N / 2.0) * d
+                                offset_up = (j - N / 2.0) * d
+                                p_world = world_pt + offset_right * right + offset_up * up
+                                
+                                # Project onto reference mesh surface
+                                local_target = ref_matrix_inverse @ p_world
+                                success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
+                                if success:
+                                    local_pt = location + normal * 0.0005
+                                    p_world = ref_matrix_world @ local_pt
+                                
+                                # Weld check with existing vertices
+                                found_v = None
+                                if self.kd_tree:
+                                    nearest = self.kd_tree.find(p_world)
+                                    if nearest:
+                                        co, index, dist = nearest
+                                        if dist < weld_threshold:
+                                            bm.verts.ensure_lookup_table()
+                                            found_v = bm.verts[index]
+                                
+                                if found_v is None:
+                                    l_co = topo_inv @ p_world
+                                    found_v = bm.verts.new(l_co)
+                                    
+                                grid_verts[(i, j)] = found_v
+                        
+                        # Assign a new unique loop ID so it gets recognized as a grid region
+                        grid_layer = bm.faces.layers.int.get("tp_is_grid") or bm.faces.layers.int.new("tp_is_grid")
+                        max_id = max([f[grid_layer] for f in bm.faces] + [0])
+                        loop_id = max_id + 1
+
+                        new_faces = []
+                        for i in range(N):
+                            for j in range(N):
+                                v1 = grid_verts[(i, j)]
+                                v2 = grid_verts[(i + 1, j)]
+                                v3 = grid_verts[(i + 1, j + 1)]
+                                v4 = grid_verts[(i, j + 1)]
+                                verts_to_use = [v1, v2, v3, v4]
+                                
+                                # Remove duplicates while preserving order
+                                verts_to_use_unique = []
+                                for v in verts_to_use:
+                                    if v not in verts_to_use_unique:
+                                        verts_to_use_unique.append(v)
+                                if len(verts_to_use_unique) < 3:
+                                    continue
+                                    
+                                try:
+                                    face = bm.faces.new(verts_to_use_unique)
+                                    if grid_layer:
+                                        face[grid_layer] = loop_id
+                                    new_faces.append(face)
+                                except ValueError:
+                                    # Face already exists or invalid
+                                    pass
+                                    
+                        if not new_faces:
+                            self.report({'WARNING'}, "方形太小或太靠近现有顶点，无法生成")
+                            return {'RUNNING_MODAL'}
+                            
+                        try:
+                            # Apply remove doubles to clean up close vertices
+                            vert_count_pre = len(bm.verts)
+                            internal_verts = self.get_internal_grid_vert_indices(bm)
+                            inner_ring_verts = self.get_ring_inner_vertices(bm)
+                            weld_verts = [v for v in bm.verts if v.index not in internal_verts and v not in inner_ring_verts]
+                            bmesh.ops.remove_doubles(bm, verts=weld_verts, dist=weld_threshold)
+                            vert_count_post = len(bm.verts)
+                            
+                            # Re-index bmesh vertices so that index lookup is correct
+                            bm.verts.index_update()
+                            new_indices = {v.index for f in new_faces if f.is_valid for v in f.verts if v.is_valid}
+                            
+                            bmesh.update_edit_mesh(topo_obj.data)
+                            
+                            if new_indices:
+                                self.conform_to_surface(context, active_indices=new_indices)
+                            
+                            self.rebuild_kd_tree()
+                            
+                            try:
+                                bpy.ops.ed.undo_push(message="绘制方形拓扑")
+                            except Exception as e:
+                                print("Error pushing undo step:", e)
+                                
+                            self.report({'INFO'}, f"已在表面生成方形拓扑面 (共 {len(new_faces)} 个面)")
+                        except Exception as e:
+                            self.report({'WARNING'}, f"生成失败: {str(e)}")
+                            
+                        context.area.tag_redraw()
+                    else:
+                        self.report({'WARNING'}, "未点击到模型表面，无法生成方形")
+                        
+                    return {'RUNNING_MODAL'}
+                elif getattr(context.scene, "tp_circle_mode", False):
+                    import math
+                    coord = (event.mouse_region_x, event.mouse_region_y)
+                    topo_obj = self.ensure_topo_obj_exists(context)
+                    if topo_obj.mode != 'EDIT':
+                        try:
+                            bpy.ops.object.mode_set(mode='EDIT')
+                        except Exception as e:
+                            print("Failed to enter Edit Mode:", e)
+                    if context.view_layer.objects.active != topo_obj:
+                        context.view_layer.objects.active = topo_obj
+                    if not topo_obj.select_get():
+                        topo_obj.select_set(True)
+                    
+                    world_pt, world_normal = None, None
+                    ref_obj_name = getattr(self, 'ref_object_name', '')
+                    if not ref_obj_name:
+                        ref_obj_name = context.window_manager.tp_ref_object_name
+                    ref_obj = bpy.data.objects.get(ref_obj_name)
+                    if ref_obj:
+                        region = context.region
+                        rv3d = context.space_data.region_3d
+                        ray_origin = region_2d_to_origin_3d(region, rv3d, coord)
+                        ray_vector = region_2d_to_vector_3d(region, rv3d, coord)
+                        matrix_world = ref_obj.matrix_world
+                        matrix_inverse = matrix_world.inverted()
+                        ray_origin_local = matrix_inverse @ ray_origin
+                        ray_vector_local = matrix_inverse.to_3x3() @ ray_vector
+                        depsgraph = context.evaluated_depsgraph_get()
+                        try:
+                            success, location, normal, face_idx = ref_obj.ray_cast(
+                                ray_origin_local,
+                                ray_vector_local,
+                                depsgraph=depsgraph
+                            )
+                        except Exception:
+                            try:
+                                success, location, normal, face_idx = ref_obj.ray_cast(
+                                    ray_origin_local,
+                                    ray_vector_local
+                                )
+                            except Exception:
+                                success = False
+                        if success:
+                            local_pt = location + normal * 0.0005
+                            world_pt = matrix_world @ local_pt
+                            world_normal = (matrix_world.to_3x3() @ normal).normalized()
+                    
+                    if world_pt and world_normal:
+                        if is_point_in_mask(world_pt, context):
+                            self.report({'WARNING'}, "无法在对称遮罩区内绘制")
+                            return {'RUNNING_MODAL'}
+                            
+                        rv3d = context.space_data.region_3d
+                        inv_view = rv3d.view_matrix.inverted()
+                        camera_right = inv_view.to_3x3() @ mathutils.Vector((1, 0, 0))
+                        
+                        right = (camera_right - camera_right.dot(world_normal) * world_normal).normalized()
+                        up = world_normal.cross(right).normalized()
+                        
+                        d = context.scene.tp_edge_length
+                        
+                        ref_matrix_world = ref_obj.matrix_world
+                        ref_matrix_inverse = ref_matrix_world.inverted()
+                        
+                        bm = bmesh.from_edit_mesh(topo_obj.data)
+                        bm.verts.ensure_lookup_table()
+                        
+                        circle_type = getattr(context.scene, "tp_circle_count", '4')
+                        try:
+                            with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                                f_log.write(f"[circle_click] circle_type={circle_type}, edge_length={d}\n")
+                        except:
+                            pass
+                        weld_threshold = d * 0.75
+                        
+                        topo_inv = topo_obj.matrix_world.inverted()
+                        
+                        # Generate the vertices
+                        if circle_type == '8_ring':
+                            # 16 vertices: 8 outer, 8 inner
+                            pts_to_create = []
+                            for k in range(8):
+                                theta = k * math.pi / 4.0
+                                p_world = world_pt + (d * math.cos(theta)) * right + (d * math.sin(theta)) * up
+                                pts_to_create.append(p_world)
+                            d_inner = d * 0.6
+                            for k in range(8):
+                                theta = k * math.pi / 4.0
+                                p_world = world_pt + (d_inner * math.cos(theta)) * right + (d_inner * math.sin(theta)) * up
+                                pts_to_create.append(p_world)
+                        else:
+                            # 9 vertices: center + 8 outer
+                            pts_to_create = [world_pt]
+                            for k in range(8):
+                                theta = k * math.pi / 4.0
+                                p_world = world_pt + (d * math.cos(theta)) * right + (d * math.sin(theta)) * up
+                                pts_to_create.append(p_world)
+                        
+                        created_verts = []
+                        for idx, p_w in enumerate(pts_to_create):
+                            # Project onto reference mesh surface
+                            local_target = ref_matrix_inverse @ p_w
+                            success, location, normal, index = ref_obj.closest_point_on_mesh(local_target)
+                            if success:
+                                local_pt = location + normal * 0.0005
+                                p_w = ref_matrix_world @ local_pt
+                            
+                            # Weld check with existing vertices
+                            found_v = None
+                            # Prevent the inner vertices (idx >= 8) of the ring from welding to anything during creation
+                            is_inner = (circle_type == '8_ring' and idx >= 8)
+                            if not is_inner and self.kd_tree:
+                                nearest = self.kd_tree.find(p_w)
+                                if nearest:
+                                    co, index, dist = nearest
+                                    if dist < weld_threshold:
+                                        bm.verts.ensure_lookup_table()
+                                        found_v = bm.verts[index]
+                            
+                            if found_v is None:
+                                l_co = topo_inv @ p_w
+                                found_v = bm.verts.new(l_co)
+                            
+                            created_verts.append(found_v)
+                        
+                        # Assign a new unique loop ID so it gets recognized as a grid region
+                        grid_layer = bm.faces.layers.int.get("tp_is_grid") or bm.faces.layers.int.new("tp_is_grid")
+                        max_id = max([f[grid_layer] for f in bm.faces] + [0])
+                        loop_id = max_id + 1
+
+                        # Define the quads
+                        if circle_type == '8_ring':
+                            quads_indices = []
+                            for k in range(8):
+                                # Outer k, Outer (k+1)%8, Inner (k+1)%8, Inner k
+                                quads_indices.append([k, (k + 1) % 8, ((k + 1) % 8) + 8, k + 8])
+                        else:
+                            quads_indices = [
+                                [0, 1, 2, 3],  # C, V0, V1, V2
+                                [0, 3, 4, 5],  # C, V2, V3, V4
+                                [0, 5, 6, 7],  # C, V4, V5, V6
+                                [0, 7, 8, 1],  # C, V6, V7, V0
+                            ]
+                        
+                        new_faces = []
+                        for q_indices in quads_indices:
+                            verts_to_use = [created_verts[idx] for idx in q_indices]
+                            # Remove duplicates while preserving order
+                            verts_to_use_unique = []
+                            for v in verts_to_use:
+                                if v not in verts_to_use_unique:
+                                    verts_to_use_unique.append(v)
+                            if len(verts_to_use_unique) < 3:
+                                continue
+                                
+                            try:
+                                face = bm.faces.new(verts_to_use_unique)
+                                if grid_layer:
+                                    face[grid_layer] = loop_id
+                                new_faces.append(face)
+                            except ValueError as e:
+                                try:
+                                    with open("d:/文档/addons/TP/debug_log_draw.txt", "a", encoding="utf-8") as f_log:
+                                        f_log.write(f"[face_create_error] vertices={[v.index for v in verts_to_use_unique]}, error={str(e)}\n")
+                                except:
+                                    pass
+                                
+                        if not new_faces:
+                            self.report({'WARNING'}, "圆形太小或太靠近现有顶点，无法生成")
+                            return {'RUNNING_MODAL'}
+                            
+                        try:
+                            # Update indices first so get_internal_grid_vert_indices has valid indices
+                            bm.verts.index_update()
+                            vert_count_pre = len(bm.verts)
+                            internal_verts = self.get_internal_grid_vert_indices(bm)
+                            excluded_indices = set(internal_verts)
+                            
+                            # Exclude all newly created vertices and all inner ring vertices of existing rings to prevent collapse
+                            new_verts_set = set(created_verts)
+                            inner_ring_verts = self.get_ring_inner_vertices(bm)
+                            weld_verts = [v for v in bm.verts if (v.index not in excluded_indices) and (v not in new_verts_set) and (v not in inner_ring_verts)]
+                            
+                            bmesh.ops.remove_doubles(bm, verts=weld_verts, dist=weld_threshold)
+                            vert_count_post = len(bm.verts)
+                            
+                            # Re-index bmesh vertices so that index lookup is correct
+                            bm.verts.index_update()
+                            new_indices = {v.index for f in new_faces if f.is_valid for v in f.verts if v.is_valid}
+                            
+                            bmesh.update_edit_mesh(topo_obj.data)
+                            
+                            if new_indices:
+                                self.conform_to_surface(context, active_indices=new_indices)
+                            
+                            self.rebuild_kd_tree()
+                            
+                            try:
+                                bpy.ops.ed.undo_push(message="绘制圆形拓扑")
+                            except Exception as e:
+                                print("Error pushing undo step:", e)
+                                
+                            self.report({'INFO'}, f"已在表面生成圆形拓扑面 (共 {len(new_faces)} 个面)")
+                        except Exception as e:
+                            self.report({'WARNING'}, f"生成失败: {str(e)}")
+                            
+                        context.area.tag_redraw()
+                    else:
+                        self.report({'WARNING'}, "未点击到模型表面，无法生成圆形")
+                        
+                    return {'RUNNING_MODAL'}
+
                 coord = (event.mouse_region_x, event.mouse_region_y)
                 self.drag_start_coord = coord
                 self.last_mouse_coord_prev = coord
@@ -1364,6 +1828,73 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                     
         internal_verts = all_grid_verts - all_boundary_verts
         return internal_verts
+
+    def get_ring_inner_vertices(self, bm):
+        grid_layer = bm.faces.layers.int.get("tp_is_grid")
+        if not grid_layer:
+            return set()
+            
+        loop_faces = {}
+        for f in bm.faces:
+            lid = f[grid_layer]
+            if lid > 0:
+                loop_faces.setdefault(lid, []).append(f)
+                
+        inner_verts = set()
+        for lid, faces in loop_faces.items():
+            loop_edges = set()
+            for f in faces:
+                loop_edges.update(f.edges)
+            # Boundary edges are those shared by exactly 1 face of this loop
+            boundary_edges = {e for e in loop_edges if sum(1 for f in e.link_faces if f[grid_layer] == lid) == 1}
+            if not boundary_edges:
+                continue
+                
+            vert_to_edges = {}
+            for e in boundary_edges:
+                for v in e.verts:
+                    vert_to_edges.setdefault(v, []).append(e)
+                    
+            visited_edges = set()
+            loops = []
+            for e in boundary_edges:
+                if e in visited_edges:
+                    continue
+                loop_verts = []
+                curr_e = e
+                curr_v = e.verts[0]
+                start_v = curr_v
+                loop_verts.append(curr_v)
+                visited_edges.add(curr_e)
+                
+                while True:
+                    next_v = curr_e.other_vert(curr_v)
+                    if next_v == start_v:
+                        break
+                    loop_verts.append(next_v)
+                    next_edges = [edge for edge in vert_to_edges.get(next_v, []) if edge != curr_e and edge not in visited_edges]
+                    if not next_edges:
+                        break
+                    curr_e = next_edges[0]
+                    curr_v = next_v
+                    visited_edges.add(curr_e)
+                if len(loop_verts) >= 3:
+                    loops.append(loop_verts)
+                    
+            if len(loops) > 1:
+                loop_radii = []
+                for loop in loops:
+                    center = mathutils.Vector((0.0, 0.0, 0.0))
+                    for v in loop:
+                        center += v.co
+                    center /= len(loop)
+                    avg_dist = sum((v.co - center).length for v in loop) / len(loop)
+                    loop_radii.append((avg_dist, loop))
+                loop_radii.sort(key=lambda x: x[0])
+                for v in loop_radii[0][1]:
+                    inner_verts.add(v)
+                    
+        return inner_verts
 
     def dist_to_face(self, pt, face):
         verts = [v.co for v in face.verts]
@@ -2030,7 +2561,8 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
         if topo_obj and topo_obj.mode == 'EDIT':
             try:
                 bm_weld = bmesh.from_edit_mesh(topo_obj.data)
-                bmesh.ops.remove_doubles(bm_weld, verts=bm_weld.verts, dist=0.001)
+                weld_dist = 0.001  # Safe threshold to remove exact duplicate vertices on select
+                bmesh.ops.remove_doubles(bm_weld, verts=bm_weld.verts, dist=weld_dist)
                 bmesh.update_edit_mesh(topo_obj.data)
             except Exception as e:
                 print("Error welding vertices on Alt+Click:", e)
@@ -3562,6 +4094,10 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             self.report({'INFO'}, "已生成包围拓扑线")
 
     def cleanup(self, context):
+        try:
+            context.window.cursor_restore()
+        except Exception:
+            pass
         global _active_draw_operator
         _active_draw_operator = None
         try:
@@ -4844,12 +5380,17 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                             print("Weld verts error:", e)
                         
             try:
+                d = context.scene.tp_edge_length
+                weld_dist = d * 0.45
+                bm.verts.ensure_lookup_table()
+                inner_ring_verts = self.get_ring_inner_vertices(bm)
                 if context.scene.tp_boundary_mode:
-                    bm.verts.ensure_lookup_table()
-                    weld_verts = [v for v in bm.verts if v.index not in self.internal_grid_verts]
-                    bmesh.ops.remove_doubles(bm, verts=weld_verts, dist=0.001)
+                    # In boundary mode, only the explicitly snapped active vertex should merge (via weld_verts above).
+                    # We do not run remove_doubles on all boundary vertices to prevent neighboring vertices (which move due to proportional drag influence) from merging.
+                    pass
                 else:
-                    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
+                    weld_verts = [v for v in bm.verts if v not in inner_ring_verts]
+                    bmesh.ops.remove_doubles(bm, verts=weld_verts, dist=weld_dist)
             except Exception as e:
                 print("Remove doubles error:", e)
                 
@@ -5402,7 +5943,9 @@ def tp_pin_depsgraph_handler(scene, depsgraph=None):
             is_interactive = (
                 getattr(active_op, 'is_grabbing', False) or
                 getattr(active_op, 'is_smoothing', False) or
-                getattr(active_op, 'is_drawing', False)
+                getattr(active_op, 'is_drawing', False) or
+                getattr(scene, "tp_square_mode", False) or
+                getattr(scene, "tp_circle_mode", False)
             )
             
             if is_interactive:
@@ -5763,6 +6306,33 @@ def on_boundary_mode_update(self, context):
                 context.scene.tool_settings.mesh_select_mode = (True, False, False)
         except Exception as e:
             print("Error in on_boundary_mode_update:", e)
+
+
+_in_mode_update = False
+
+def on_square_mode_update(self, context):
+    global _in_mode_update
+    if _in_mode_update:
+        return
+    _in_mode_update = True
+    try:
+        if context.scene.tp_square_mode:
+            context.scene.tp_circle_mode = False
+    finally:
+        _in_mode_update = False
+
+def on_circle_mode_update(self, context):
+    global _in_mode_update
+    if _in_mode_update:
+        return
+    _in_mode_update = True
+    try:
+        if context.scene.tp_circle_mode:
+            context.scene.tp_square_mode = False
+    finally:
+        _in_mode_update = False
+
+
 class OBJECT_OT_tp_apply_symmetry(bpy.types.Operator):
     bl_idname = "object.tp_apply_symmetry"
     bl_label = "确认对称"
@@ -5779,6 +6349,25 @@ class OBJECT_OT_tp_apply_symmetry(bpy.types.Operator):
         if not topo_obj:
             self.report({'WARNING'}, "未找到拓扑网格对象")
             return {'CANCELLED'}
+
+        # 确认前取消所有固定内容
+        context.scene.tp_pin_boundary = False
+        import bmesh
+        if topo_obj.mode == 'EDIT':
+            bm = bmesh.from_edit_mesh(topo_obj.data)
+            bm.verts.ensure_lookup_table()
+            pin_layer = bm.verts.layers.int.get("tp_is_pinned")
+            if pin_layer:
+                for v in bm.verts:
+                    v[pin_layer] = 0
+            bmesh.update_edit_mesh(topo_obj.data)
+        else:
+            pin_attr = topo_obj.data.attributes.get("tp_is_pinned")
+            if pin_attr:
+                for val in pin_attr.data:
+                    val.value = 0
+            topo_obj.data.update()
+        update_pinned_coordinates(context)
 
         scene = context.scene
         mod_name = "TP_Mirror"

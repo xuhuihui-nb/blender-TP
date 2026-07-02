@@ -33,7 +33,6 @@ classes = (
     op_draw.OBJECT_OT_tp_apply_symmetry,
     op_grid_fill.OBJECT_OT_tp_topology_grid_fill,
     op_grid_fill.OBJECT_OT_tp_topology_remove_grid,
-    ui.OBJECT_OT_tp_topology_auto_outline,
     ui.OBJECT_OT_tp_set_fixed_point_count,
     ui.VIEW3D_PT_tp_topology,
 )
@@ -83,6 +82,38 @@ def register():
         description="显示白边外圈并允许拖拽调整栅格",
         default=True,
         update=op_draw.on_boundary_mode_update
+    )
+    bpy.types.Scene.tp_square_mode = bpy.props.BoolProperty(
+        name="方形模式",
+        description="开启方形绘制模式：按住Ctrl时，光标变为绿色正方形，并在模型表面点击绘制正方形网格",
+        default=False,
+        update=op_draw.on_square_mode_update
+    )
+    bpy.types.Scene.tp_circle_mode = bpy.props.BoolProperty(
+        name="圆形模式",
+        description="开启圆形绘制模式：按住Ctrl时，光标变为绿色正八边形，并在模型表面点击绘制圆形网格",
+        default=False,
+        update=op_draw.on_circle_mode_update
+    )
+    bpy.types.Scene.tp_circle_count = bpy.props.EnumProperty(
+        items=[
+            ('4', "4格圆形", "4个方块组成的圆形"),
+            ('8_ring', "8格圆环", "8个方块组成的中空圆环")
+        ],
+        name="圆形格数",
+        description="圆形模式中生成的网格类型",
+        default='4'
+    )
+    bpy.types.Scene.tp_square_count = bpy.props.EnumProperty(
+        items=[
+            ('1', "1", "1个方块 (1x1)"),
+            ('4', "4", "4个方块 (2x2)"),
+            ('16', "16", "16个方块 (4x4)"),
+            ('64', "64", "64个方块 (8*8)")
+        ],
+        name="方块数量",
+        description="方形模式中生成的方块数量",
+        default='1'
     )
     bpy.types.Scene.tp_smooth_strength = bpy.props.FloatProperty(
         name="平滑力度",
@@ -175,6 +206,10 @@ def unregister():
     del bpy.types.Scene.tp_fixed_point_count
     del bpy.types.Scene.tp_use_wrap
     del bpy.types.Scene.tp_boundary_mode
+    del bpy.types.Scene.tp_square_mode
+    del bpy.types.Scene.tp_circle_mode
+    del bpy.types.Scene.tp_circle_count
+    del bpy.types.Scene.tp_square_count
     del bpy.types.Scene.tp_smooth_strength
     del bpy.types.Scene.tp_pin_boundary
     del bpy.types.Scene.tp_seam_edge
