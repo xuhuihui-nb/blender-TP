@@ -441,6 +441,13 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
             self.report({'INFO'}, "已退出TP拓扑模式")
             return {'FINISHED'}
 
+        if not context.region or not context.area:
+            if event.type == 'ESC':
+                self.cleanup(context)
+                self.report({'INFO'}, "已退出TP拓扑模式")
+                return {'FINISHED'}
+            return {'PASS_THROUGH'}
+
         # Check if loop cut is active
         loopcut_active = self.is_loopcut_active(context)
         if loopcut_active:
@@ -819,7 +826,7 @@ class OBJECT_OT_tp_topology_draw(bpy.types.Operator):
                         context.area.tag_redraw()
                         return {'RUNNING_MODAL'}
 
-            if context.region.type != 'WINDOW':
+            if not context.region or context.region.type != 'WINDOW':
                 return {'PASS_THROUGH'}
                 
             if event.type == 'LEFTMOUSE' and event.value == 'PRESS' and not event.ctrl:
